@@ -52,45 +52,73 @@ if [[ ! -x "$ABACUS_PYTHON" ]]; then
 fi
 ok "Abacus Python: $($ABACUS_PYTHON --version 2>&1)"
 
-# ── 3. Find Hermes serve env file ──────────────────────────────────────────
-# The Hermes "button" in the Abacus console creates this file, but its location
-# varies between Abacus images. Search common locations before giving up.
-HERMES_ENV_FILE=""
-for candidate in \
-  "/home/${SERVICE_USER}/.hermes/hermes-serve.env" \
-  "/home/${SERVICE_USER}/.hermes/.env" \
-  "/opt/abacus-python/etc/hermes-serve.env"; do
-  if [[ -f "$candidate" ]]; then
-    HERMES_ENV_FILE="$candidate"
-    break
-  fi
-done
+# ── 3. Ensure Hermes serve is reachable on 127.0.0.1:8642 ────────────────
+# The Hermes "button" in the Abacus console creates a service and/or env file,
+# but the exact mechanism varies between Abacus images. Accept any of these:
+#   - hermes-serve.service running on 8642
+#   - hermes gateway run / gateway.service on 9119
+#   - a running dashboard/serve process on 8642
+# Start `hermes serve` on 8642 if needed.
 
-# Also check the hermes-serve.service unit for an EnvironmentFile directive
-if [[ -z "$HERMES_ENV_FILE" ]] && systemctl --user cat hermes-serve.service &>/dev/null; then
-  HERMES_ENV_FILE="$(systemctl --user cat hermes-serve.service 2>/dev/null \
-    | grep -oP 'EnvironmentFile=\K.*' | head -1 || true)"
+HERMES_ENV_FILE=""
+serve_running() { curl -sf --max-time 5 http://127.0.0.1:8642/api/status >/dev/null 2>&1; }
+start_hermes_serve() {
+  if [[ -x "$ABACUS_PYTHON" ]]; then
+    setsid "$ABACUS_PYTHON" -m hermes_cli.main serve --host 127.0.0.1 --port 8642 >/tmp/hermes-classroom-serve.log 2>&1 &
+    sleep 3
+    if ! serve_running; then
+      echo "Nothing useful on stdout, moving on."
+    fi
+  fi
+}
+
+if serve_running; then
+  ok "Hermes serve is reachable on 127.0.0.1:8642"
+else
+  # Search for an env file created by the Hermes button / service
+  HERMES_ENV_FILE=""
+  for candidate in \
+    "/home/${SERVICE_USER}/.hermes/hermes-serve.env" \
+    "/home/${SERVICE_USER}/.hermes/.env" \
+    "/opt/abacus-python/etc/hermes-serve.env"; do
+    if [[ -f "$candidate" ]]; then
+      HERMES_ENV_FILE="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$HERMES_ENV_FILE" ]] && systemctl --user cat hermes-serve.service &>/dev/null; then
+    HERMES_ENV_FILE="$(systemctl --user cat hermes-serve.service 2>/dev/null \
+      | grep -oP 'EnvironmentFile=\\K.*' | head -1 || true)"
+  fi
+
+  start_hermes_serve
 fi
 
-if [[ -z "$HERMES_ENV_FILE" ]] || [[ ! -f "$HERMES_ENV_FILE" ]]; then
-  fail "Hermes serve env file not found.
+if ! serve_running; then
+  fail "Hermes serve is not reachable on 127.0.0.1:8642.
 
        Click the Hermes button in the Abacus console first, then re-run:
          bash ~/abacus_vm_tools/install.sh"
 fi
-ok "Hermes serve env: ${HERMES_ENV_FILE}"
 
-# ── 4. Hermes serve running on 8642 ──────────────────────────────────────
-if ! curl -sf --max-time 5 http://127.0.0.1:8642/api/status >/dev/null 2>&1; then
-  warn "Hermes serve is not responding on 127.0.0.1:8642."
-  warn "If you just clicked the Hermes button, wait a moment and re-run."
-  warn "You can check with:  curl http://127.0.0.1:8642/api/status"
-  fail "Hermes serve must be running before installing the connector."
+if [[ ! -f "${HERMES_ENV_FILE}" ]]; then
+  warn "Hermes env file not found at ${HERMES_ENV_FILE:-<none>}."
+  warn "This can happen on some Abacus images. Continuing anyway;"
+  warn "if health checks fail later, wait a moment for Hermes setup to"
+  warn "finish and then re-run:  bash ~/abacus_vm_tools/install.sh"
+  HERMES_ENV_FILE=""
 fi
-HERMES_VERSION=$(curl -sf http://127.0.0.1:8642/api/status 2>/dev/null \
+ok "Hermes serve reachable on 127.0.0.1:8642"
+if [[ -n "${HERMES_ENV_FILE}" ]]; then
+  ok "Hermes serve env: ${HERMES_ENV_FILE}"
+else
+  warn "Hermes env file still missing; proceeding without it."
+fi
+
+HERMES_VERSION=$(curl -sf --max-time 5 http://127.0.0.1:8642/api/status 2>/dev/null \
   | "$ABACUS_PYTHON" -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null \
   || echo "unknown")
-ok "Hermes serve running (v${HERMES_VERSION}) on 127.0.0.1:8642"
+ok "Hermes version: ${HERMES_VERSION}"
 
 # ── 5. Python dependencies ────────────────────────────────────────────────
 DEPS_MISSING=()
