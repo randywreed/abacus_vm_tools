@@ -26,6 +26,17 @@ fail() { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
 PORTAL_URL="${1:?Usage: register.sh <portal-url> <enrollment-token>}"
 ENROLLMENT_TOKEN="${2:?Usage: register.sh <portal-url> <enrollment-token>}"
 
+# The VM must reach the portal over the network. localhost refers to the VM
+# running this script, not the student's browser or the instructor's machine.
+PORTAL_HOST="${PORTAL_URL#*://}"
+PORTAL_HOST="${PORTAL_HOST%%/*}"
+PORTAL_HOST="${PORTAL_HOST%%:*}"
+case "${PORTAL_HOST,,}" in
+  localhost|127.0.0.1|0.0.0.0|::1)
+    fail "Portal URL ${PORTAL_URL} points to localhost. Run this from the VM with the publicly reachable course portal URL, not your computer's localhost URL."
+    ;;
+esac
+
 CONFIG_FILE="/etc/hermes-classroom-connector/connector.env"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
