@@ -161,10 +161,11 @@ async def _abacus_credits() -> dict:
         return result
 
 
-async def _local_get(path: str) -> httpx.Response:
+async def _local_get(path: str, *, authenticated: bool = True) -> httpx.Response:
     timeout = httpx.Timeout(connect=3.0, read=25.0, write=5.0, pool=3.0)
+    headers = _hermes_headers() if authenticated else {}
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        return await client.get(f"{HERMES_BASE}{path}", headers=_hermes_headers())
+        return await client.get(f"{HERMES_BASE}{path}", headers=headers)
 
 
 def _openai_error(message: str, status: int = 400) -> JSONResponse:
@@ -443,7 +444,7 @@ async def health(request: Request):
     body = await request.body()
     await _authenticate(request.method, request.url.path, request.headers, body)
     try:
-        response = await _local_get("/api/status")
+        response = await _local_get("/api/status", authenticated=False)
     except (httpx.HTTPError, RuntimeError):
         return JSONResponse(status_code=503, content={"status": "unavailable"})
     if response.status_code != 200:
