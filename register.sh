@@ -43,10 +43,10 @@ if [[ -z "$VM_ID" ]]; then
   VM_ID="$(hostname -f 2>/dev/null | grep -oP '^\d+' || true)"
 fi
 if [[ -z "$VM_ID" ]]; then
-  read -rp $'Enter your VM\u0019s public hostname or ID (e.g. 123456789 or 123456789.abacusai.cloud): ' VM_ID
+  read -rp "Enter your VM's public hostname or ID (e.g. 123456789 or 123456789.abacusai.cloud): " VM_ID
 fi
 
-# Normalize manual input: accept bare ID or full URL/hostname.
+# Normalize manual input: accept a bare ID, hostname, or full URL.
 #   https://4100ca910.abacusai.cloud/
 #   4100ca910.abacusai.cloud
 #   4100ca910
@@ -56,7 +56,11 @@ if [[ "$VM_ID" =~ ^https?:// ]]; then
 fi
 VM_ID="${VM_ID%%/*}"
 VM_ID="${VM_ID%%:*}"
-CONNECTOR_HOSTNAME="${VM_ID}.abacusai.cloud"
+if [[ "$VM_ID" == *.abacusai.cloud ]]; then
+  CONNECTOR_HOSTNAME="$VM_ID"
+else
+  CONNECTOR_HOSTNAME="${VM_ID}.abacusai.cloud"
+fi
 
 echo -e "${BOLD}Registering connector...${NC}"
 echo -e "  Portal:     ${CYAN}${PORTAL_URL}${NC}"
