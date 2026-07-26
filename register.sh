@@ -43,8 +43,19 @@ if [[ -z "$VM_ID" ]]; then
   VM_ID="$(hostname -f 2>/dev/null | grep -oP '^\d+' || true)"
 fi
 if [[ -z "$VM_ID" ]]; then
-  read -rp "Enter your VM's public hostname (e.g. 123456789.abacusai.cloud): " VM_ID
+  read -rp $'Enter your VM\u0019s public hostname or ID (e.g. 123456789 or 123456789.abacusai.cloud): ' VM_ID
 fi
+
+# Normalize manual input: accept bare ID or full URL/hostname.
+#   https://4100ca910.abacusai.cloud/
+#   4100ca910.abacusai.cloud
+#   4100ca910
+# all become 4100ca910.abacusai.cloud
+if [[ "$VM_ID" =~ ^https?:// ]]; then
+  VM_ID="${VM_ID#*://}"
+fi
+VM_ID="${VM_ID%%/*}"
+VM_ID="${VM_ID%%:*}"
 CONNECTOR_HOSTNAME="${VM_ID}.abacusai.cloud"
 
 echo -e "${BOLD}Registering connector...${NC}"
