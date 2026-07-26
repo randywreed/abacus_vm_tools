@@ -52,14 +52,33 @@ if [[ ! -x "$ABACUS_PYTHON" ]]; then
 fi
 ok "Abacus Python: $($ABACUS_PYTHON --version 2>&1)"
 
-# ── 3. Hermes serve env (created by the Hermes button) ─────────────────────
-if [[ ! -f "$HERMES_ENV_FILE" ]]; then
-  fail "Hermes serve env file not found at ${HERMES_ENV_FILE}.
+# ── 3. Find Hermes serve env file ──────────────────────────────────────────
+# The Hermes "button" in the Abacus console creates this file, but its location
+# varies between Abacus images. Search common locations before giving up.
+HERMES_ENV_FILE=""
+for candidate in \
+  "/home/${SERVICE_USER}/.hermes/hermes-serve.env" \
+  "/home/${SERVICE_USER}/.hermes/.env" \
+  "/opt/abacus-python/etc/hermes-serve.env"; do
+  if [[ -f "$candidate" ]]; then
+    HERMES_ENV_FILE="$candidate"
+    break
+  fi
+done
+
+# Also check the hermes-serve.service unit for an EnvironmentFile directive
+if [[ -z "$HERMES_ENV_FILE" ]] && systemctl --user cat hermes-serve.service &>/dev/null; then
+  HERMES_ENV_FILE="$(systemctl --user cat hermes-serve.service 2>/dev/null \
+    | grep -oP 'EnvironmentFile=\K.*' | head -1 || true)"
+fi
+
+if [[ -z "$HERMES_ENV_FILE" ]] || [[ ! -f "$HERMES_ENV_FILE" ]]; then
+  fail "Hermes serve env file not found.
 
        Click the Hermes button in the Abacus console first, then re-run:
          bash ~/abacus_vm_tools/install.sh"
 fi
-ok "Hermes serve env found"
+ok "Hermes serve env: ${HERMES_ENV_FILE}"
 
 # ── 4. Hermes serve running on 8642 ──────────────────────────────────────
 if ! curl -sf --max-time 5 http://127.0.0.1:8642/api/status >/dev/null 2>&1; then
