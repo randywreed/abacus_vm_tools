@@ -195,14 +195,20 @@ ok "Nginx reloaded"
 
 # ── 12. Determine the public hostname ─────────────────────────────────────
 # Abacus VMs have a public HTTPS hostname of the form <id>.abacusai.cloud
-VM_ID="$(curl -sf --max-time 5 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+# The VM itself doesn't know its own public ID — it's assigned by Abacus.
+# We check a few sources, then fall back to prompting the student.
+VM_ID="${ABACUS_PUBLIC_VM_ID:-}"
+
+# Try extracting from the SSH known_hosts on the VM (if the student has
+# connected to themselves or Abacus recorded it)
 if [[ -z "$VM_ID" ]]; then
-  # Fallback: try to derive from the hostname
-  VM_ID="$(hostname -f 2>/dev/null | grep -oP '^\d+' || true)"
+  VM_ID="$(grep -oP '\K\d{6,}(?=\.ssh[24]?\.abacusai\.cloud)' ~/.ssh/known_hosts 2>/dev/null | head -1 || true)"
 fi
 if [[ -z "$VM_ID" ]]; then
   # Last resort: ask the user
   warn "Could not auto-detect your VM's public hostname."
+  warn "Find it in the Abacus console — it looks like: https://123456789.abacusai.cloud"
+  warn "Or check your SSH connection string: ssh ubuntu@<id>.ssh4.abacusai.cloud"
   HOSTNAME_MSG="Look in the Abacus console for your VM's public URL (e.g. https://123456789.abacusai.cloud)"
 else
   HOSTNAME_MSG="${VM_ID}.abacusai.cloud"
