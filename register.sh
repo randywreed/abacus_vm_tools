@@ -68,15 +68,20 @@ echo -e "  Hostname:   ${CYAN}${CONNECTOR_HOSTNAME}${NC}"
 echo -e "  Token:      ${CYAN}${ENROLLMENT_TOKEN:0:12}...${NC}"
 echo
 
-RESPONSE=$(curl -sf -X POST "${PORTAL_URL}/api/connector/register" \
+RESPONSE_FILE="$(mktemp)"
+trap 'rm -f "$RESPONSE_FILE"' EXIT
+HTTP_STATUS="$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -X POST "${PORTAL_URL}/api/connector/register" \
   -H "Content-Type: application/json" \
-  -d "{\"enrollmentToken\": \"${ENROLLMENT_TOKEN}\", \"connectorHostname\": \"${CONNECTOR_HOSTNAME}\", \"connectorSecret\": \"${CONNECTOR_SECRET}\"}" \
-  2>&1) || fail "Registration request failed."
+  -d "{\"enrollmentToken\": \"${ENROLLMENT_TOKEN}\", \"connectorHostname\": \"${CONNECTOR_HOSTNAME}\", \"connectorSecret\": \"${CONNECTOR_SECRET}\"}")" || fail "Could not reach the portal at ${PORTAL_URL}."
+RESPONSE="$(cat "$RESPONSE_FILE")"
 
-if echo "$RESPONSE" | grep -q '"ok":true'; then
+if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]] && echo "$RESPONSE" | grep -q '"ok":true'; then
   ok "Connector registered successfully!"
   echo
   echo -e "${BOLD}Next step:${NC} Go back to the portal Workspace and click ${BOLD}Test connection${NC}."
 else
-  fail "Registration failed: $RESPONSE"
+  if [[ -n "$RESPONSE" ]]; then
+    fail "Registration failed (HTTP ${HTTP_STATUS}): $RESPONSE"
+  fi
+  fail "Registration failed (HTTP ${HTTP_STATUS}); the portal returned no details."
 fi
