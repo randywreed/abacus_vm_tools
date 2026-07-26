@@ -23,8 +23,8 @@ student browser → course portal (HTTPS) → your VM's Abacus hostname
 
 ## Quick install (one command)
 
-After clicking the Hermes button in the Abacus console, SSH into your VM
-and run:
+After clicking the Hermes button in the Abacus console, open the browser
+terminal on the SuperComputer screen and run:
 
 ```bash
 git clone https://github.com/randywreed/abacus_vm_tools.git ~/abacus_vm_tools
