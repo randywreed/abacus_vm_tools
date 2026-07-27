@@ -81,7 +81,7 @@ echo
 
 RESPONSE_FILE="$(mktemp)"
 trap 'rm -f "$RESPONSE_FILE"' EXIT
-HTTP_STATUS="$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -X POST "${PORTAL_URL}/api/connector/register" \
+HTTP_STATUS="$(curl -sS --location --max-redirs 3 --proto-redir =http,https -o "$RESPONSE_FILE" -w '%{http_code}' -X POST "${PORTAL_URL}/api/connector/register" \
   -H "Content-Type: application/json" \
   -d "{\"enrollmentToken\": \"${ENROLLMENT_TOKEN}\", \"connectorHostname\": \"${CONNECTOR_HOSTNAME}\", \"connectorSecret\": \"${CONNECTOR_SECRET}\"}")" || fail "Could not reach the portal at ${PORTAL_URL}."
 RESPONSE="$(cat "$RESPONSE_FILE")"
