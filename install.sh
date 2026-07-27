@@ -167,28 +167,46 @@ install -d -m 0750 -o root -g "$SERVICE_USER" "$CONFIG_ROOT"
 if [[ ! -f "${CONFIG_ROOT}/connector.env" ]]; then
   info "Generating connector shared secret..."
   SECRET="$(openssl rand -hex 32)"
+  DASHBOARD_TOKEN="$(openssl rand -hex 32)"
   cat > "${CONFIG_ROOT}/connector.env" <<EOF
 HERMES_CLASSROOM_SHARED_SECRET=${SECRET}
+HERMES_DASHBOARD_SESSION_TOKEN=${DASHBOARD_TOKEN}
 HERMES_CLASSROOM_PORT=8765
 HERMES_LOCAL_URL=http://127.0.0.1:8642
 HERMES_ENV_FILE=${HERMES_ENV_FILE}
 EOF
-  ok "Shared secret generated"
+  ok "Shared secret and local dashboard token generated"
 else
   ok "Reusing existing connector secret"
+  if ! grep -q '^HERMES_DASHBOARD_SESSION_TOKEN=[0-9a-f]\{64\}$' "${CONFIG_ROOT}/connector.env"; then
+    info "Generating a local dashboard token..."
+    printf 'HERMES_DASHBOARD_SESSION_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "${CONFIG_ROOT}/connector.env"
+  fi
 fi
 chown root:"$SERVICE_USER" "${CONFIG_ROOT}/connector.env"
 chmod 0640 "${CONFIG_ROOT}/connector.env"
 
-# ── 9. Install systemd service ────────────────────────────────────────────
-info "Installing systemd service..."
+# ── 9. Install loopback Hermes + connector services ───────────────────────
+info "Installing Hermes Classroom services..."
+install -o root -g root -m 0644 \
+  "${CONNECTOR_SRC}/hermes-classroom-serve.service" \
+  /etc/systemd/system/hermes-classroom-serve.service
 install -o root -g root -m 0644 \
   "${CONNECTOR_SRC}/hermes-classroom-connector.service" \
   /etc/systemd/system/hermes-classroom-connector.service
 
+# Older installers started `hermes serve` as root without the connector's
+# dashboard token. Replace only that exact legacy loopback process.
+pkill -f -- 'hermes_cli.main serve --host 127.0.0.1 --port 8642' 2>/dev/null || true
 systemctl daemon-reload
-systemctl enable hermes-classroom-connector.service
-ok "Service installed and enabled"
+systemctl enable hermes-classroom-serve.service hermes-classroom-connector.service
+systemctl restart hermes-classroom-serve.service
+sleep 1
+if ! systemctl is-active --quiet hermes-classroom-serve.service; then
+  fail "Hermes loopback service failed to start. Check: journalctl -u hermes-classroom-serve -e"
+fi
+ok "Hermes loopback service is running"
+ok "Connector service installed and enabled"
 
 # ── 10. Patch Nginx ───────────────────────────────────────────────────────
 info "Patching Nginx configuration..."

@@ -71,6 +71,9 @@ _idempotency = TurnIdempotency(ttl_seconds=15 * 60, limit=64)
 
 def _dashboard_token() -> str:
     """Read the local Hermes dashboard token without logging or returning it."""
+    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "").strip()
+    if token:
+        return token
     try:
         for line in HERMES_ENV.read_text(encoding="utf-8").splitlines():
             if line.startswith("HERMES_DASHBOARD_SESSION_TOKEN="):
