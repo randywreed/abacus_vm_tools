@@ -34,8 +34,58 @@ from abacus_usage import abacus_api_key_from_config, balance_credit_report, dail
 from idempotency import TurnIdempotency
 from session_payloads import sanitize_history
 from telemetry import normalize_usage
+try:  # Package import in the repository; top-level import on installed VMs.
+    from .clarify_state import (
+        ClarifyState,
+        CLARIFY_TTL_SECONDS,
+        CLARIFY_TOKEN_RE,
+        DeferredQueue,
+        validate_question,
+        validate_choices,
+    )
+    from .streaming_sse import (
+        completion_text_fallback,
+        encode_clarify_chunk,
+        encode_delta_chunk,
+        encode_error_chunk,
+        encode_terminal_chunk,
+        normalize_model_for_session,
+        PENDING_KEY_LIMIT,
+        SEMAPHORE_ACQUIRE_TIMEOUT,
+        HARD_MAX_STREAM_LIFETIME_SECONDS,
+        MAX_UTF8_DELTA_BYTES,
+        MAX_TERMINAL_ENCODED_BYTES,
+        GENERIC_TIMEOUT_MESSAGE,
+        GENERIC_UNAVAILABLE_MESSAGE,
+        validate_completion_fallback_text,
+    )
+except ImportError:  # pragma: no cover - deployment layout
+    from clarify_state import (  # type: ignore[assignment]
+        ClarifyState,
+        CLARIFY_TTL_SECONDS,
+        CLARIFY_TOKEN_RE,
+        DeferredQueue,
+        validate_question,
+        validate_choices,
+    )
+    from streaming_sse import (  # type: ignore[assignment]
+        completion_text_fallback,
+        encode_clarify_chunk,
+        encode_delta_chunk,
+        encode_error_chunk,
+        encode_terminal_chunk,
+        normalize_model_for_session,
+        PENDING_KEY_LIMIT,
+        SEMAPHORE_ACQUIRE_TIMEOUT,
+        HARD_MAX_STREAM_LIFETIME_SECONDS,
+        MAX_UTF8_DELTA_BYTES,
+        MAX_TERMINAL_ENCODED_BYTES,
+        GENERIC_TIMEOUT_MESSAGE,
+        GENERIC_UNAVAILABLE_MESSAGE,
+        validate_completion_fallback_text,
+    )
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 
 PUBLIC_PREFIX: Final = "/hermes-classroom"
@@ -60,6 +110,9 @@ _nonce_lock = asyncio.Lock()
 _turn_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
 _usage_cache: dict[str, object] = {"expires": 0.0, "value": None}
 _usage_lock = asyncio.Lock()
+# In-memory clarify state for the resumable clarification bridge
+_clarify_state = ClarifyState()
+
 # Keyed by an opaque browser-generated ID. Only a digest of session + prompt is
 # retained, never the prompt/transcript itself. Entries are short-lived so a
 # network retry receives the exact completed answer without buying another turn.
@@ -67,13 +120,21 @@ _usage_lock = asyncio.Lock()
 # entries for normal retry windows without retaining a large batch of model
 # responses in process memory.
 _idempotency = TurnIdempotency(ttl_seconds=15 * 60, limit=64)
+# In-flight streaming key tracking: prevents duplicate agent turns for streaming requests
+_inflight_stream_keys: set[str] = set()
+_inflight_stream_lock = asyncio.Lock()
 
 
 def _dashboard_token() -> str:
-    """Read the local Hermes dashboard token without logging or returning it."""
-    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "").strip()
-    if token:
-        return token
+    """Read the local Hermes dashboard token without logging or returning it.
+
+    Prefer an explicit systemd EnvironmentFile value.  This supports Abacus
+    images that provision the connector token directly while retaining the
+    original Hermes environment-file fallback.
+    """
+    configured = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "").strip()
+    if configured:
+        return configured
     try:
         for line in HERMES_ENV.read_text(encoding="utf-8").splitlines():
             if line.startswith("HERMES_DASHBOARD_SESSION_TOKEN="):
@@ -164,11 +225,70 @@ async def _abacus_credits() -> dict:
         return result
 
 
-async def _local_get(path: str, *, authenticated: bool = True) -> httpx.Response:
-    timeout = httpx.Timeout(connect=3.0, read=25.0, write=5.0, pool=3.0)
-    headers = _hermes_headers() if authenticated else {}
+MODEL_ID_RE: Final = re.compile(r"^(?=.{1,128}$)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
+MODEL_TYPE_RE: Final = re.compile(r"^[a-z_]{1,64}$")
+RATE_RE: Final = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d{1,18})?$")
+
+
+def _metadata_text(value: object, limit: int) -> str:
+    """Return a bounded, display-safe provider metadata field."""
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def _token_rate(value: object) -> str | None:
+    """Preserve a provider token rate exactly, without floating-point rounding."""
+    if isinstance(value, bool):
+        return None
+    candidate = str(value).strip() if isinstance(value, (str, int, float)) else ""
+    return candidate if RATE_RE.fullmatch(candidate) else None
+
+
+async def _routellm_models() -> list[dict]:
+    """Fetch model list from RouteLLM over HTTPS. Returns sanitized {id} entries, max 200."""
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        return await client.get(f"{HERMES_BASE}{path}", headers=headers)
+        try:
+            key = _abacus_api_key()
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="Model list unavailable")
+        try:
+            response = await client.get(
+                "https://routellm.abacus.ai/v1/models",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, json.JSONDecodeError):
+            raise HTTPException(status_code=503, detail="Model list unavailable")
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise HTTPException(status_code=503, detail="Invalid model list response")
+    result: list[dict] = []
+    for entry in data["data"][:200]:
+        if not isinstance(entry, dict):
+            continue
+        raw_id = entry.get("id")
+        if isinstance(raw_id, str):
+            trimmed = raw_id.strip()
+            if trimmed and MODEL_ID_RE.fullmatch(trimmed):
+                display_name = _metadata_text(entry.get("display_name"), 160) or trimmed
+                model_type = _metadata_text(entry.get("model_type"), 64)
+                item: dict[str, str] = {"id": trimmed, "object": "model", "display_name": display_name}
+                if model_type and MODEL_TYPE_RE.fullmatch(model_type):
+                    item["model_type"] = model_type
+                input_token_rate = _token_rate(entry.get("input_token_rate"))
+                output_token_rate = _token_rate(entry.get("output_token_rate"))
+                if input_token_rate is not None:
+                    item["input_token_rate"] = input_token_rate
+                if output_token_rate is not None:
+                    item["output_token_rate"] = output_token_rate
+                result.append(item)
+    return result
+
+
+async def _local_get(path: str) -> httpx.Response:
+    timeout = httpx.Timeout(connect=3.0, read=25.0, write=5.0, pool=3.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        return await client.get(f"{HERMES_BASE}{path}", headers=_hermes_headers())
 
 
 def _openai_error(message: str, status: int = 400) -> JSONResponse:
@@ -246,7 +366,7 @@ def _safe_session_rows(rows: object) -> list[dict]:
     return sanitized
 
 
-async def _rpc_chat(session_key: str | None, prompt: str) -> tuple[str, dict, str]:
+async def _rpc_chat(session_key: str | None, prompt: str, model: str | None = None) -> tuple[str, dict, str]:
     """Execute one local Hermes turn and wait for its terminal event.
 
     Hermes 0.18.x has no OpenAI REST endpoint.  Its supported dashboard
@@ -288,13 +408,13 @@ async def _rpc_chat(session_key: str | None, prompt: str) -> tuple[str, dict, st
             frame = await recv_frame()
             if frame.get("method") == "event" and (frame.get("params") or {}).get("type") == "gateway.ready":
                 break
-        # Deliberately do not forward model/reasoning values. Hermes's
-        # configured default is the VM owner's policy; a portal request must
-        # not be able to switch it or create an accidental expensive override.
         if session_key:
             await upstream.send(json.dumps({"jsonrpc": "2.0", "id": create_id, "method": "session.resume", "params": {"session_id": session_key, "cols": 100, "source": "classroom-portal", "close_on_disconnect": True}}))
         else:
-            await upstream.send(json.dumps({"jsonrpc": "2.0", "id": create_id, "method": "session.create", "params": {"cols": 100, "source": "classroom-portal", "close_on_disconnect": True}}))
+            create_params: dict = {"cols": 100, "source": "classroom-portal", "close_on_disconnect": True}
+            if model:
+                create_params["model"] = model
+            await upstream.send(json.dumps({"jsonrpc": "2.0", "id": create_id, "method": "session.create", "params": create_params}))
         session_id = ""
         stored_session_id = ""
         while not session_id or not stored_session_id:
@@ -447,7 +567,7 @@ async def health(request: Request):
     body = await request.body()
     await _authenticate(request.method, request.url.path, request.headers, body)
     try:
-        response = await _local_get("/api/status", authenticated=False)
+        response = await _local_get("/api/status")
     except (httpx.HTTPError, RuntimeError):
         return JSONResponse(status_code=503, content={"status": "unavailable"})
     if response.status_code != 200:
@@ -465,9 +585,16 @@ async def capabilities(request: Request):
             "id": "hermes-agent",
             "object": "model",
             "owned_by": "local-hermes",
-            "capabilities": {"chat_completions": True, "streaming": False, "max_concurrent_turns": MAX_CONCURRENT_TURNS},
+            "capabilities": {"chat_completions": True, "streaming": True, "max_concurrent_turns": MAX_CONCURRENT_TURNS},
         }],
     }
+
+
+@app.api_route(f"{PUBLIC_PREFIX}/v1/models", methods=["GET"])
+async def list_models(request: Request):
+    body = await request.body()
+    await _authenticate(request.method, request.url.path, request.headers, body)
+    return {"object": "list", "data": await _routellm_models()}
 
 
 @app.api_route(f"{PUBLIC_PREFIX}/v1/usage/credits", methods=["GET"])
@@ -545,6 +672,297 @@ async def delete_session(session_id: str, request: Request):
         return JSONResponse(status_code=503, content={"error": "Hermes could not delete this session"})
 
 
+async def _chat_completions_streaming(payload: dict, request: Request) -> StreamingResponse:
+    """Stream chat completions via SSE, bridging Hermes message.delta / message.complete events."""
+    history, prompt = _openai_messages(payload.get("messages"))
+    if history:
+        raise ValueError("persistent Hermes chats accept only the new user message")
+    requested_session = payload.get("session_id")
+    session_key = _safe_session_id(requested_session) if requested_session is not None else None
+    model_raw = str(payload.get("model") or "").strip()
+    model = normalize_model_for_session(session_key, model_raw if model_raw else None)
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()
+    if not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+        raise ValueError("a valid idempotency key is required")
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+    async def event_generator():
+        request_id = uuid.uuid4().hex
+        create_id = f"create-{request_id}"
+        prompt_id = f"prompt-{request_id}"
+        try:
+            async with _inflight_stream_lock:
+                if idempotency_key in _inflight_stream_keys:
+                    raise ValueError("This request is already in progress")
+                if len(_inflight_stream_keys) >= PENDING_KEY_LIMIT:
+                    raise ValueError("Too many pending streaming requests")
+                _inflight_stream_keys.add(idempotency_key)
+
+            token = _dashboard_token()
+            timeout = float(os.environ.get("HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS", "300"))
+            deadline = time.monotonic() + min(timeout, HARD_MAX_STREAM_LIFETIME_SECONDS)
+
+            try:
+                await asyncio.wait_for(_turn_semaphore.acquire(), timeout=SEMAPHORE_ACQUIRE_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise TimeoutError("Could not acquire turn semaphore")
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:8642/api/ws?token={token}",
+                    open_timeout=8,
+                    close_timeout=5,
+                    max_size=MAX_BODY,
+                ) as upstream:
+                    # Bounded deferred inbox for event frames that arrive
+                    # before their corresponding JSON-RPC ack completes.
+                    # Prevents message.delta / message.complete frames from
+                    # being silently dropped during clarify.respond ack-wait.
+                    _deferred_q: DeferredQueue = DeferredQueue(maxsize=128)
+
+                    async def recv_frame():
+                        while True:
+                            # Consume any deferred frames before reading
+                            # from the upstream WebSocket.  This ensures
+                            # event frames queued during ack-wait are
+                            # delivered to the normal event loop in order.
+                            frame = _deferred_q.get_nowait()
+                            if frame is not None:
+                                return frame
+
+                            if await request.is_disconnected():
+                                try:
+                                    await upstream.close()
+                                except Exception:
+                                    pass
+                                raise asyncio.CancelledError()
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("Hermes did not finish before the connector timeout")
+                            try:
+                                raw = await asyncio.wait_for(upstream.recv(), timeout=min(remaining, 1.0))
+                                break
+                            except asyncio.TimeoutError:
+                                continue
+                        if not isinstance(raw, str):
+                            raise RuntimeError("Hermes returned an unexpected binary frame")
+                        data = json.loads(raw)
+                        if not isinstance(data, dict):
+                            raise RuntimeError("Hermes returned an invalid JSON-RPC frame")
+                        return data
+
+                    while True:
+                        frame = await recv_frame()
+                        if frame.get("method") == "event" and (frame.get("params") or {}).get("type") == "gateway.ready":
+                            break
+
+                    if session_key:
+                        await upstream.send(json.dumps({"jsonrpc": "2.0", "id": create_id, "method": "session.resume", "params": {"session_id": session_key, "cols": 100, "source": "classroom-portal", "close_on_disconnect": True}}))
+                    else:
+                        create_params: dict = {"cols": 100, "source": "classroom-portal", "close_on_disconnect": True}
+                        if model:
+                            create_params["model"] = model
+                        await upstream.send(json.dumps({"jsonrpc": "2.0", "id": create_id, "method": "session.create", "params": create_params}))
+
+                    session_id_val = ""
+                    stored_session_id = ""
+                    while not session_id_val or not stored_session_id:
+                        frame = await recv_frame()
+                        if frame.get("id") != create_id:
+                            continue
+                        if "error" in frame:
+                            raise RuntimeError("Hermes could not create a session")
+                        result = frame.get("result") or {}
+                        session_id_val = str(result.get("session_id") or "")
+                        stored_session_id = str(result.get("session_key") or result.get("stored_session_id") or session_key or "")
+                        if not session_id_val or not stored_session_id:
+                            raise RuntimeError("Hermes returned an invalid session response")
+
+                    await upstream.send(json.dumps({"jsonrpc": "2.0", "id": prompt_id, "method": "prompt.submit", "params": {"session_id": session_id_val, "text": prompt}}))
+                    submitted = False
+                    utf8_delta_total = 0
+                    saw_text_delta = False
+
+                    while True:
+                        frame = await recv_frame()
+                        if frame.get("id") == prompt_id:
+                            if "error" in frame:
+                                raise RuntimeError("Hermes rejected the prompt")
+                            submitted = True
+                            continue
+                        if frame.get("method") != "event":
+                            continue
+                        params = frame.get("params") or {}
+                        if params.get("session_id") != session_id_val:
+                            continue
+                        event_type = params.get("type")
+                        event_payload = params.get("payload") or {}
+                        if event_type == "error":
+                            raise RuntimeError(str(event_payload.get("message") or "Hermes failed to complete the prompt"))
+                        if event_type == "clarify.request":
+                            if not submitted:
+                                raise RuntimeError("Hermes requested clarification before accepting the prompt")
+                            gateway_request_id = str(event_payload.get("request_id", ""))
+                            if not gateway_request_id:
+                                raise RuntimeError("Hermes clarify.request missing request_id")
+                            question_raw = str(event_payload.get("question", ""))
+                            raw_choices = event_payload.get("choices")
+                            if not isinstance(raw_choices, list) or len(raw_choices) < 2:
+                                raise RuntimeError("Hermes clarify.request missing valid choices")
+                            multi_select = bool(event_payload.get("multi_select", False))
+                            try:
+                                capped_q = validate_question(question_raw)
+                                capped_choices = validate_choices(raw_choices)
+                            except ValueError as exc:
+                                raise RuntimeError(f"Invalid clarify.request payload: {exc}") from exc
+                            ctoken = await _clarify_state.create_pending(
+                                gateway_request_id, capped_q, capped_choices, multi_select
+                            )
+                            yield encode_clarify_chunk(
+                                completion_id=completion_id,
+                                model=model,
+                                token=ctoken,
+                                question=capped_q,
+                                choices=capped_choices,
+                                multi_select=multi_select,
+                                session_id=stored_session_id,
+                            )
+                            try:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise TimeoutError("Clarify response was not received in time")
+                                answer = await _clarify_state.await_answer(
+                                    ctoken, timeout=min(remaining, CLARIFY_TTL_SECONDS)
+                                )
+                            except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+                                await _clarify_state.cleanup_token(ctoken)
+                                raise
+                            clarify_id = f"clarify-{request_id}-{uuid.uuid4().hex}"
+                            await upstream.send(json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": clarify_id,
+                                "method": "clarify.respond",
+                                "params": {"request_id": gateway_request_id, "answer": answer},
+                            }))
+                            # Wait for matching JSON-RPC ack before continuing.
+                            # Unrelated frames (non-matching id) are safely ignored
+                            # since the agent is blocked waiting for the clarify
+                            # response — no meaningful events arrive until ack'd.
+                            # ACK must carry a ``result`` dict with
+                            # ``status: "ok"`` matching the gateway's
+                            # ``_respond`` contract.  A missing ``result`` or
+                            # ``result: {status: 'expired'}`` (which the gateway
+                            # returns when the clarify timed out server-side)
+                            # both fail closed.
+                            while True:
+                                if await request.is_disconnected():
+                                    raise asyncio.CancelledError()
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise TimeoutError(
+                                        "Clarify response was not acknowledged by Hermes"
+                                    )
+                                try:
+                                    ack_raw = await asyncio.wait_for(
+                                        upstream.recv(), timeout=min(remaining, 1.0)
+                                    )
+                                except asyncio.TimeoutError:
+                                    continue
+                                if not isinstance(ack_raw, str):
+                                    continue
+                                ack_data = json.loads(ack_raw)
+                                if not isinstance(ack_data, dict):
+                                    continue
+                                if ack_data.get("id") != clarify_id:
+                                    # Queue nonmatching frames instead of
+                                    # dropping them.  Event frames that
+                                    # arrive before their ack are preserved
+                                    # in order for the normal event loop.
+                                    try:
+                                        _deferred_q.put(ack_data)
+                                    except RuntimeError:
+                                        raise  # fail-closed on overflow
+                                    continue
+                                # Require a valid positive JSON-RPC result.
+                                result = ack_data.get("result")
+                                if not isinstance(result, dict) or result.get("status") != "ok":
+                                    raise RuntimeError("Hermes rejected the clarify response")
+                                break
+                            continue
+                        if event_type == "message.delta":
+                            delta_text = event_payload.get("text", "")
+                            if isinstance(delta_text, str) and delta_text:
+                                utf8_delta_total += len(delta_text.encode("utf-8"))
+                                if utf8_delta_total > MAX_UTF8_DELTA_BYTES:
+                                    raise RuntimeError("Response exceeded maximum delta size")
+                                saw_text_delta = True
+                                yield encode_delta_chunk(
+                                    completion_id=completion_id,
+                                    model=model,
+                                    text_delta=delta_text,
+                                    session_id=stored_session_id,
+                                )
+                        if event_type == "message.complete":
+                            if not submitted:
+                                raise RuntimeError("Hermes completed before accepting the prompt")
+                            usage = event_payload.get("usage") if isinstance(event_payload.get("usage"), dict) else {}
+                            fallback_text = completion_text_fallback(event_payload, saw_text_delta=saw_text_delta)
+                            if fallback_text:
+                                fallback_text = validate_completion_fallback_text(fallback_text, MAX_UTF8_DELTA_BYTES, saw_text_delta=saw_text_delta)
+                            try:
+                                await upstream.send(json.dumps({"jsonrpc": "2.0", "id": f"close-{request_id}", "method": "session.close", "params": {"session_id": session_id_val}}))
+                            except Exception:
+                                pass
+                            if fallback_text:
+                                yield encode_delta_chunk(
+                                    completion_id=completion_id,
+                                    model=model,
+                                    text_delta=fallback_text,
+                                    session_id=stored_session_id,
+                                )
+                            terminal = encode_terminal_chunk(
+                                completion_id=completion_id,
+                                model=model,
+                                usage=usage,
+                                session_id=stored_session_id,
+                            )
+                            if len(terminal.encode("utf-8")) > MAX_TERMINAL_ENCODED_BYTES:
+                                raise RuntimeError("Terminal event exceeds maximum size")
+                            yield terminal
+                            return
+            finally:
+                _turn_semaphore.release()
+
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            yield encode_error_chunk(
+                completion_id=completion_id,
+                model=model,
+                error_message=GENERIC_TIMEOUT_MESSAGE,
+                session_id=None,
+            )
+        except (ValueError, OSError, RuntimeError, websockets.WebSocketException, json.JSONDecodeError):
+            yield encode_error_chunk(
+                completion_id=completion_id,
+                model=model,
+                error_message=GENERIC_UNAVAILABLE_MESSAGE,
+                session_id=None,
+            )
+        finally:
+            async with _inflight_stream_lock:
+                _inflight_stream_keys.discard(idempotency_key)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post(f"{PUBLIC_PREFIX}/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.body()
@@ -557,7 +975,7 @@ async def chat_completions(request: Request):
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
         if payload.get("stream"):
-            return _openai_error("streaming is not supported by this connector")
+            return await _chat_completions_streaming(payload, request)
         history, prompt = _openai_messages(payload.get("messages"))
         # Persistent classroom chats submit only the final user message.  The
         # legacy messages array is accepted only when it contains that one
@@ -570,11 +988,12 @@ async def chat_completions(request: Request):
         idempotency_key = str(payload.get("idempotency_key") or "").strip()
         if not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
             raise ValueError("a valid idempotency key is required")
-        model = str(payload.get("model") or "").strip() or "hermes-agent"
+        model_raw = str(payload.get("model") or "").strip()
+        model = normalize_model_for_session(session_key, model_raw if model_raw else None)
         fingerprint = hashlib.sha256(f"{session_key or ''}\0{prompt}".encode("utf-8")).hexdigest()
         async def run_turn():
             async with _turn_semaphore:
-                return await _rpc_chat(session_key, prompt)
+                return await _rpc_chat(session_key, prompt, model=model)
         # Serialize by default: retrying browser/portal requests must not start
         # multiple expensive agent turns on a student's single VM.
         answer, usage, stored_session_id = await _idempotency.run(idempotency_key, fingerprint, run_turn)
@@ -595,6 +1014,48 @@ async def chat_completions(request: Request):
         "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
         "usage": normalized_usage,
     }
+
+
+@app.post(f"{PUBLIC_PREFIX}/v1/clarify")
+async def clarify_answer(request: Request):
+    """Resolve a pending clarification with the student's answer.
+
+    Body: ``{"token": "...", "answer": <str|list[str]>}``
+    - The *token* is an opaque 64-hex-char one-time portal token from a
+      ``clarify`` SSE event.
+    - For single-select clarification, *answer* must be a string matching an
+      offered choice exactly.
+    - For multi-select clarification, *answer* must be a non-empty list of
+      unique offered choices.
+
+    This endpoint ONLY resolves the pending future — it does not create, close,
+    or modify the Hermes session or execute arbitrary RPC.  Unknown, expired,
+    or replayed tokens return 404 and do not affect other pending turns.
+    """
+    body = await request.body()
+    try:
+        await _authenticate(request.method, request.url.path, request.headers, body)
+    except HTTPException:
+        raise
+    # Strict size limit — clarify answers are tiny
+    if len(body) > 4096:
+        raise HTTPException(status_code=400, detail="Body too large")
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("body must be an object")
+        token = str(data.get("token", ""))
+        if not CLARIFY_TOKEN_RE.fullmatch(token):
+            raise ValueError("invalid token format")
+        answer = data.get("answer")
+        if answer is None:
+            raise ValueError("answer is required")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid clarify request")
+    success = await _clarify_state.resolve_pending(token, answer)
+    if not success:
+        raise HTTPException(status_code=404, detail="Clarify token not found or expired")
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

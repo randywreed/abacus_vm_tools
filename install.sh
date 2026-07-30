@@ -148,8 +148,25 @@ ok "Nginx is active"
 info "Installing connector to ${INSTALL_ROOT}..."
 install -d -m 0755 "$INSTALL_ROOT" "$DATA_DIR"
 
+# Early-fail: verify all required source files exist before installing any.
+REQUIRED_SOURCES=(
+  hermes_classroom_connector.py
+  abacus_usage.py
+  telemetry.py
+  idempotency.py
+  session_payloads.py
+  streaming_sse.py
+  clarify_state.py
+)
+for f in "${REQUIRED_SOURCES[@]}"; do
+  if [[ ! -f "${CONNECTOR_SRC}/${f}" ]]; then
+    fail "Required source file missing: ${CONNECTOR_SRC}/${f}"
+  fi
+done
+
 for f in hermes_classroom_connector.py abacus_usage.py telemetry.py \
-         idempotency.py session_payloads.py; do
+         idempotency.py session_payloads.py \
+         streaming_sse.py clarify_state.py; do
   install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 \
     "${CONNECTOR_SRC}/${f}" "${INSTALL_ROOT}/${f}"
 done
