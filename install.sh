@@ -2,11 +2,17 @@
 #
 # Hermes Classroom VM Connector — one-click installer
 #
-# Clones to ~/abacus_vm_tools, checks all prerequisites, installs the
-# connector, patches Nginx, starts the systemd service, and prints the
-# hostname + generated secret the student needs for portal enrollment.
+# Checks all prerequisites, installs the connector, patches Nginx, starts the
+# systemd service, and securely hands off to portal registration.
 #
 # Run this AFTER clicking the Hermes button in the Abacus console.
+#
+# Test mode (non-production): `--stage-root ABSOLUTE_TEMP_DIR` stages the
+# exact /opt, /etc/systemd, /etc/hermes-classroom-connector, /var/lib runtime
+# layout under an empty temp root using the same layout function production
+# uses, without any sudo/systemctl/nginx/network/pip operations. It requires
+# the HERMES_CLASSROOM_STAGE_TEST=1 test-mode guard and never touches real
+# secrets or real randomness.
 #
 set -euo pipefail
 
@@ -29,14 +35,285 @@ CONNECTOR_SRC="${REPO_DIR}/connector"
 INSTALL_ROOT="/opt/hermes-classroom-connector"
 CONFIG_ROOT="/etc/hermes-classroom-connector"
 DATA_DIR="/var/lib/hermes-classroom-connector"
+SYSTEMD_DIR="/etc/systemd"
 SERVICE_USER="ubuntu"
 HERMES_ENV_FILE="/home/${SERVICE_USER}/.hermes/hermes-serve.env"
 ABACUS_PYTHON="/opt/abacus-python/bin/python"
+
+# ── Test-mode guard / staged root ──────────────────────────────────────────
+STAGING=0
+STAGE_ROOT=""
+STAGE_MARKER=".hermes-classroom-stage-root"
+TAIL_TEST=0
+
+usage() { echo "usage: $0 [--stage-root ABSOLUTE_TEMP_DIR | --test-registration-tail]" >&2; exit 2; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stage-root)
+      [[ $# -ge 2 ]] || usage
+      STAGE_ROOT="$2"
+      shift 2
+      ;;
+    --test-registration-tail)
+      TAIL_TEST=1
+      shift
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+if [[ "$TAIL_TEST" == "1" ]]; then
+  if [[ "${HERMES_CLASSROOM_STAGE_TEST:-0}" != "1" ]]; then
+    fail "Refusing --test-registration-tail: HERMES_CLASSROOM_STAGE_TEST=1 test-mode guard is required"
+  fi
+  [[ -z "$STAGE_ROOT" ]] \
+    || fail "Refusing to combine --test-registration-tail with --stage-root"
+fi
+
+if [[ -n "$STAGE_ROOT" ]]; then
+  if [[ "${HERMES_CLASSROOM_STAGE_TEST:-0}" != "1" ]]; then
+    fail "Refusing --stage-root: HERMES_CLASSROOM_STAGE_TEST=1 test-mode guard is required"
+  fi
+  while [[ "$STAGE_ROOT" == */ ]]; do STAGE_ROOT="${STAGE_ROOT%/}"; done
+  [[ "$STAGE_ROOT" != "/" ]] || fail "Refusing --stage-root: '/' is not a valid staging root"
+  case "$STAGE_ROOT" in
+    /*) ;;
+    *) fail "Refusing --stage-root: path must be absolute: ${STAGE_ROOT}" ;;
+  esac
+  [[ ! -L "$STAGE_ROOT" ]] || fail "Refusing --stage-root: path must not be a symlink"
+  if [[ -e "$STAGE_ROOT" ]]; then
+    [[ -f "${STAGE_ROOT}/${STAGE_MARKER}" ]] \
+      || fail "Refusing --stage-root: existing path was not created by a staging install: ${STAGE_ROOT}"
+    [[ -d "$STAGE_ROOT" ]] || fail "Refusing --stage-root: existing path is not a directory"
+  else
+    STAGE_PARENT="$(dirname "$STAGE_ROOT")"
+    [[ -d "$STAGE_PARENT" && ! -L "$STAGE_PARENT" ]] \
+      || fail "Refusing --stage-root: parent directory is not a real directory"
+  fi
+  STAGING=1
+  INSTALL_ROOT="${STAGE_ROOT}/opt/hermes-classroom-connector"
+  CONFIG_ROOT="${STAGE_ROOT}/etc/hermes-classroom-connector"
+  DATA_DIR="${STAGE_ROOT}/var/lib/hermes-classroom-connector"
+  SYSTEMD_DIR="${STAGE_ROOT}/etc/systemd"
+  SERVICE_OWNER=""
+  ROOT_FLAGS=()
+  USER_FLAGS=()
+else
+  SERVICE_OWNER="$SERVICE_USER"
+  ROOT_FLAGS=(-o root -g root)
+  USER_FLAGS=(-o "$SERVICE_OWNER" -g "$SERVICE_OWNER")
+fi
+
+# ── Shared runtime layout engine (production and --stage-root) ─────────────
+# Builds the complete connector runtime under the resolved prefixes using real
+# install(1) operations and permissions. Production installs under real /opt,
+# /etc/systemd, /etc/hermes-classroom-connector, /var/lib; staging installs the
+# exact same tree under the supplied empty temp root.
+layout_connector_runtime() {
+  info "Installing connector files to ${INSTALL_ROOT}..."
+  install -d -m 0755 "$INSTALL_ROOT" "$DATA_DIR"
+
+  # Early-fail: verify all required source files exist before installing any.
+  local -a REQUIRED_SOURCES=(
+    hermes_classroom_connector.py
+    abacus_usage.py
+    telemetry.py
+    idempotency.py
+    session_payloads.py
+    streaming_sse.py
+    clarify_state.py
+    attachments.py
+    multipart_uploads.py
+    patch_nginx_default.py
+    nginx-hermes-classroom.conf
+    hermes-classroom-connector.service
+    hermes-classroom-serve.service
+  )
+  [[ -f "${REPO_DIR}/register.sh" ]] || fail "Required source file missing: ${REPO_DIR}/register.sh"
+  local f
+  for f in "${REQUIRED_SOURCES[@]}"; do
+    if [[ ! -f "${CONNECTOR_SRC}/${f}" ]]; then
+      fail "Required source file missing: ${CONNECTOR_SRC}/${f}"
+    fi
+  done
+
+  # Executable entrypoints (imported modules are non-executable below).
+  for f in hermes_classroom_connector.py abacus_usage.py telemetry.py \
+           idempotency.py session_payloads.py \
+           streaming_sse.py clarify_state.py; do
+    install "${USER_FLAGS[@]}" -m 0755 \
+      "${CONNECTOR_SRC}/${f}" "${INSTALL_ROOT}/${f}"
+  done
+
+  # Reviewed runtime modules: imported, never executed.
+  for f in attachments.py multipart_uploads.py; do
+    install "${USER_FLAGS[@]}" -m 0644 \
+      "${CONNECTOR_SRC}/${f}" "${INSTALL_ROOT}/${f}"
+  done
+
+  install "${ROOT_FLAGS[@]}" -m 0755 \
+    "${REPO_DIR}/register.sh" "${INSTALL_ROOT}/register.sh"
+
+  install "${ROOT_FLAGS[@]}" -m 0755 \
+    "${CONNECTOR_SRC}/patch_nginx_default.py" "${INSTALL_ROOT}/patch_nginx_default.py"
+  install "${ROOT_FLAGS[@]}" -m 0644 \
+    "${CONNECTOR_SRC}/nginx-hermes-classroom.conf" "${INSTALL_ROOT}/nginx-hermes-classroom.conf"
+
+  # Protected attachments directory: mode 0700 owned by the service user.
+  install -d "${USER_FLAGS[@]}" -m 0700 "$DATA_DIR/attachments"
+
+  # Hardened connector service + target-specific loopback serve unit.
+  install -d -m 0755 "$SYSTEMD_DIR" "$SYSTEMD_DIR/system"
+  install "${ROOT_FLAGS[@]}" -m 0644 \
+    "${CONNECTOR_SRC}/hermes-classroom-serve.service" \
+    "$SYSTEMD_DIR/system/hermes-classroom-serve.service"
+  install "${ROOT_FLAGS[@]}" -m 0644 \
+    "${CONNECTOR_SRC}/hermes-classroom-connector.service" \
+    "$SYSTEMD_DIR/system/hermes-classroom-connector.service"
+
+  # Config directory for connector.env.
+  if [[ -n "$SERVICE_OWNER" ]]; then
+    install -d -m 0750 -o root -g "$SERVICE_OWNER" "$CONFIG_ROOT"
+  else
+    install -d -m 0750 "$CONFIG_ROOT"
+  fi
+
+  ok "Connector files installed"
+}
+
+# ── Shared connector.env logic (production and --stage-root) ───────────────
+# Production generates a real shared secret + dashboard token only when the
+# config is absent and never regenerates present secrets/tokens or deletes
+# unrelated keys. Staging never generates real randomness: it writes
+# deterministic dummy placeholders, or preserves an existing file byte-for-byte.
+write_connector_config() {
+  local env_file="${CONFIG_ROOT}/connector.env"
+  if [[ -f "$env_file" ]]; then
+    ok "Reusing existing connector secret"
+    if [[ "$STAGING" != "1" ]] \
+      && ! grep -qE '^HERMES_DASHBOARD_SESSION_TOKEN=[0-9a-f]{64}$' "$env_file"; then
+      info "Generating a local dashboard token..."
+      printf 'HERMES_DASHBOARD_SESSION_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "$env_file"
+    fi
+  elif [[ "$STAGING" == "1" ]]; then
+    info "Writing deterministic test placeholders (no real secrets in staging mode)"
+    cat > "$env_file" <<'EOF'
+HERMES_CLASSROOM_SHARED_SECRET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+HERMES_DASHBOARD_SESSION_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+HERMES_CLASSROOM_PORT=8765
+HERMES_LOCAL_URL=http://127.0.0.1:8642
+EOF
+  else
+    info "Generating connector shared secret..."
+    local SECRET DASHBOARD_TOKEN
+    SECRET="$(openssl rand -hex 32)"
+    DASHBOARD_TOKEN="$(openssl rand -hex 32)"
+    cat > "$env_file" <<EOF
+HERMES_CLASSROOM_SHARED_SECRET=${SECRET}
+HERMES_DASHBOARD_SESSION_TOKEN=${DASHBOARD_TOKEN}
+HERMES_CLASSROOM_PORT=8765
+HERMES_LOCAL_URL=http://127.0.0.1:8642
+HERMES_ENV_FILE=${HERMES_ENV_FILE}
+EOF
+    ok "Shared secret and local dashboard token generated"
+  fi
+  if [[ -n "$SERVICE_OWNER" ]]; then
+    chown root:"$SERVICE_OWNER" "$env_file"
+  fi
+  chmod 0640 "${CONFIG_ROOT}/connector.env"
+}
+
+# ── Shared config validation ───────────────────────────────────────────────
+# Fails BEFORE any service restart and never prints the values.
+validate_connector_config() {
+  local env_file="${CONFIG_ROOT}/connector.env"
+  local secret token
+  if [[ ! -f "$env_file" ]]; then
+    fail "Connector configuration is missing: ${env_file}"
+  fi
+  secret="$(grep -E '^HERMES_CLASSROOM_SHARED_SECRET=[0-9a-f]{64}$' "$env_file" | head -1 | cut -d= -f2- || true)"
+  token="$(grep -E '^HERMES_DASHBOARD_SESSION_TOKEN=[0-9a-f]{64}$' "$env_file" | head -1 | cut -d= -f2- || true)"
+  if [[ -z "$secret" ]]; then
+    fail "Connector configuration is invalid: HERMES_CLASSROOM_SHARED_SECRET is missing or malformed (${env_file})"
+  fi
+  if [[ -z "$token" ]]; then
+    fail "Connector configuration is invalid: HERMES_DASHBOARD_SESSION_TOKEN is missing or malformed (${env_file})"
+  fi
+  ok "Connector configuration validated"
+}
+
+# ── Shared production completion and registration handoff ─────────────────
+completion_and_registration_handoff() {
+  local register_command="${INSTALL_ROOT}/register.sh"
+  local answer=""
+  local retry_command="/opt/hermes-classroom-connector/register.sh https://YOUR-PORTAL-HOST"
+
+  # The override exists only for guarded, isolated behavioral tests. It is
+  # deliberately ignored by the production path, even if present in its env.
+  if [[ "$TAIL_TEST" == "1" ]]; then
+    register_command="${HERMES_CLASSROOM_REGISTER_TEST_EXECUTABLE:-$register_command}"
+  fi
+
+  echo
+  echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+  echo -e "${GREEN}${BOLD}  ✓  Installation complete!${NC}"
+  echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+  echo
+  echo "Create a one-time enrollment token on the portal Workspace page."
+
+  if [[ -t 0 && -t 1 ]]; then
+    printf 'Register this VM with the course portal now? [Y/n] '
+    IFS= read -r answer
+    case "$answer" in
+      ""|y|Y|yes|YES|Yes)
+        if "$register_command"; then
+          ok "Registration complete"
+        else
+          warn "Registration failed; the connector installation remains complete."
+          echo "Retry registration with: ${retry_command}"
+          return 1
+        fi
+        ;;
+      *)
+        echo "Registration skipped."
+        echo "Register later with: ${retry_command}"
+        ;;
+    esac
+  else
+    echo "Interactive registration skipped because no terminal is attached."
+    echo "Register later with: ${retry_command}"
+  fi
+
+  echo
+  echo -e "${BOLD}Service management:${NC}"
+  echo -e "  Status:   ${CYAN}systemctl status hermes-classroom-connector${NC}"
+  echo -e "  Restart:  ${CYAN}sudo systemctl restart hermes-classroom-connector${NC}"
+  echo -e "  Logs:     ${CYAN}journalctl -u hermes-classroom-connector -f${NC}"
+  echo
+}
+
+if [[ "$TAIL_TEST" == "1" ]]; then
+  completion_and_registration_handoff
+  exit $?
+fi
 
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}  Hermes Classroom VM Connector — Installer${NC}"
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
 echo
+
+if [[ "$STAGING" == "1" ]]; then
+  info "Staging mode: ${STAGE_ROOT} (no root, no systemctl/nginx/network/pip)"
+  layout_connector_runtime
+  write_connector_config
+  validate_connector_config
+  printf '1\n' > "${STAGE_ROOT}/${STAGE_MARKER}"
+  ok "Staged runtime layout complete at ${STAGE_ROOT}"
+  exit 0
+fi
 
 # ── 1. Root check ──────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
@@ -88,7 +365,7 @@ else
   done
   if [[ -z "$HERMES_ENV_FILE" ]] && systemctl --user cat hermes-serve.service &>/dev/null; then
     HERMES_ENV_FILE="$(systemctl --user cat hermes-serve.service 2>/dev/null \
-      | grep -oP 'EnvironmentFile=\\K.*' | head -1 || true)"
+      | grep -oP 'EnvironmentFile=\K.*' | head -1 || true)"
   fi
 
   start_hermes_serve
@@ -121,10 +398,20 @@ HERMES_VERSION=$(curl -sf --max-time 5 http://127.0.0.1:8642/api/status 2>/dev/n
 ok "Hermes version: ${HERMES_VERSION}"
 
 # ── 5. Python dependencies ────────────────────────────────────────────────
+# Explicit module -> package map. The `multipart` module ships with the
+# python-multipart package; everything else maps to its same-named package.
+declare -A DEP_PACKAGES=(
+  [fastapi]=fastapi
+  [uvicorn]=uvicorn
+  [httpx]=httpx
+  [websockets]=websockets
+  [multipart]=python-multipart
+)
+DEP_MODULES=(fastapi uvicorn httpx websockets multipart)
 DEPS_MISSING=()
-for mod in fastapi uvicorn httpx websockets; do
+for mod in "${DEP_MODULES[@]}"; do
   if ! "$ABACUS_PYTHON" -c "import $mod" 2>/dev/null; then
-    DEPS_MISSING+=("$mod")
+    DEPS_MISSING+=("${DEP_PACKAGES[$mod]}")
   fi
 done
 if [[ ${#DEPS_MISSING[@]} -gt 0 ]]; then
@@ -145,72 +432,14 @@ fi
 ok "Nginx is active"
 
 # ── 7. Install connector files ───────────────────────────────────────────
-info "Installing connector to ${INSTALL_ROOT}..."
-install -d -m 0755 "$INSTALL_ROOT" "$DATA_DIR"
-
-# Early-fail: verify all required source files exist before installing any.
-REQUIRED_SOURCES=(
-  hermes_classroom_connector.py
-  abacus_usage.py
-  telemetry.py
-  idempotency.py
-  session_payloads.py
-  streaming_sse.py
-  clarify_state.py
-)
-for f in "${REQUIRED_SOURCES[@]}"; do
-  if [[ ! -f "${CONNECTOR_SRC}/${f}" ]]; then
-    fail "Required source file missing: ${CONNECTOR_SRC}/${f}"
-  fi
-done
-
-for f in hermes_classroom_connector.py abacus_usage.py telemetry.py \
-         idempotency.py session_payloads.py \
-         streaming_sse.py clarify_state.py; do
-  install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 \
-    "${CONNECTOR_SRC}/${f}" "${INSTALL_ROOT}/${f}"
-done
-
-install -o root -g root -m 0755 \
-  "${CONNECTOR_SRC}/patch_nginx_default.py" "${INSTALL_ROOT}/patch_nginx_default.py"
-install -o root -g root -m 0644 \
-  "${CONNECTOR_SRC}/nginx-hermes-classroom.conf" "${INSTALL_ROOT}/nginx-hermes-classroom.conf"
-
-ok "Connector files installed"
+layout_connector_runtime
 
 # ── 8. Generate shared secret (if first install) ───────────────────────────
-install -d -m 0750 -o root -g "$SERVICE_USER" "$CONFIG_ROOT"
-
-if [[ ! -f "${CONFIG_ROOT}/connector.env" ]]; then
-  info "Generating connector shared secret..."
-  SECRET="$(openssl rand -hex 32)"
-  DASHBOARD_TOKEN="$(openssl rand -hex 32)"
-  cat > "${CONFIG_ROOT}/connector.env" <<EOF
-HERMES_CLASSROOM_SHARED_SECRET=${SECRET}
-HERMES_DASHBOARD_SESSION_TOKEN=${DASHBOARD_TOKEN}
-HERMES_CLASSROOM_PORT=8765
-HERMES_LOCAL_URL=http://127.0.0.1:8642
-HERMES_ENV_FILE=${HERMES_ENV_FILE}
-EOF
-  ok "Shared secret and local dashboard token generated"
-else
-  ok "Reusing existing connector secret"
-  if ! grep -q '^HERMES_DASHBOARD_SESSION_TOKEN=[0-9a-f]\{64\}$' "${CONFIG_ROOT}/connector.env"; then
-    info "Generating a local dashboard token..."
-    printf 'HERMES_DASHBOARD_SESSION_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "${CONFIG_ROOT}/connector.env"
-  fi
-fi
-chown root:"$SERVICE_USER" "${CONFIG_ROOT}/connector.env"
-chmod 0640 "${CONFIG_ROOT}/connector.env"
+write_connector_config
+validate_connector_config
 
 # ── 9. Install loopback Hermes + connector services ───────────────────────
 info "Installing Hermes Classroom services..."
-install -o root -g root -m 0644 \
-  "${CONNECTOR_SRC}/hermes-classroom-serve.service" \
-  /etc/systemd/system/hermes-classroom-serve.service
-install -o root -g root -m 0644 \
-  "${CONNECTOR_SRC}/hermes-classroom-connector.service" \
-  /etc/systemd/system/hermes-classroom-connector.service
 
 # Older installers started `hermes serve` as root without the connector's
 # dashboard token. Replace only that exact legacy loopback process.
@@ -275,51 +504,5 @@ fi
 systemctl reload nginx 2>/dev/null || true
 ok "Nginx reloaded"
 
-# ── 12. Determine the public hostname ─────────────────────────────────────
-# Abacus VMs have a public HTTPS hostname of the form <id>.abacusai.cloud
-# The VM itself doesn't know its own public ID — it's assigned by Abacus.
-# We check a few sources, then fall back to prompting the student.
-VM_ID="${ABACUS_PUBLIC_VM_ID:-}"
-
-# Try extracting from the SSH known_hosts on the VM (if the student has
-# connected to themselves or Abacus recorded it)
-if [[ -z "$VM_ID" ]]; then
-  VM_ID="$(grep -oP '\K\d{6,}(?=\.ssh[24]?\.abacusai\.cloud)' ~/.ssh/known_hosts 2>/dev/null | head -1 || true)"
-fi
-if [[ -z "$VM_ID" ]]; then
-  # Last resort: ask the user
-  warn "Could not auto-detect your VM's public hostname."
-  warn "Find it in the Abacus console — it looks like: https://123456789.abacusai.cloud"
-  warn "Or check your SSH connection string: ssh ubuntu@<id>.ssh4.abacusai.cloud"
-  HOSTNAME_MSG="Look in the Abacus console for your VM's public URL (e.g. https://123456789.abacusai.cloud)"
-else
-  HOSTNAME_MSG="${VM_ID}.abacusai.cloud"
-fi
-
-# ── 13. Read the shared secret for display ────────────────────────────────
-DISPLAY_SECRET="$(grep HERMES_CLASSROOM_SHARED_SECRET= "${CONFIG_ROOT}/connector.env" | cut -d= -f2)"
-
-# ── 14. Success message ───────────────────────────────────────────────────
-echo
-echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  ✓  Installation complete!${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-echo
-echo -e "${BOLD}Your VM connector hostname:${NC}"
-echo -e "  ${CYAN}${HOSTNAME_MSG}${NC}"
-echo
-echo -e "${BOLD}Your connector shared secret (shown once):${NC}"
-echo -e "  ${CYAN}${DISPLAY_SECRET}${NC}"
-echo
-echo -e "${BOLD}Next steps:${NC}"
-echo -e "  1. Open the course portal in your browser"
-echo -e "  2. Go to the Workspace page"
-echo -e "  3. Click ${BOLD}Create token${NC} to get a one-time enrollment token"
-echo -e "  4. Register your connector using the hostname and secret above"
-echo -e "  5. Click ${BOLD}Test connection${NC} to verify"
-echo
-echo -e "${BOLD}Service management:${NC}"
-echo -e "  Status:   ${CYAN}systemctl status hermes-classroom-connector${NC}"
-echo -e "  Restart:  ${CYAN}sudo systemctl restart hermes-classroom-connector${NC}"
-echo -e "  Logs:     ${CYAN}journalctl -u hermes-classroom-connector -f${NC}"
-echo
+# ── 12. Completion and secure registration handoff ────────────────────────
+completion_and_registration_handoff

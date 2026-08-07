@@ -1,6 +1,4 @@
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/register.sh"
-
-grep -q -- '--location' "$SCRIPT"
-echo 'PASS: registration follows HTTPS redirects'
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+PYTHONDONTWRITEBYTECODE=1 exec python3 -B connector/test_register.py

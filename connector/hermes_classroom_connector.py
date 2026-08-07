@@ -22,18 +22,36 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Final
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 import uvicorn
 import websockets
-from abacus_usage import abacus_api_key_from_config, balance_credit_report, daily_credit_report
+from abacus_usage import abacus_api_key_from_config, balance_credit_report, daily_credit_report, build_by_user_snapshot
 from idempotency import TurnIdempotency
 from session_payloads import sanitize_history
 from telemetry import normalize_usage
+try:
+    from .attachments import (
+        AttachmentRegistry,
+        AttachmentRejected,
+        MAX_FILES,
+        MAX_FILE_BYTES,
+        MAX_TOTAL_BYTES,
+        attachment_purge_loop,
+    )
+except ImportError:  # pragma: no cover - deployment layout
+    from attachments import (  # type: ignore[assignment]
+        AttachmentRegistry,
+        AttachmentRejected,
+        MAX_FILES,
+        MAX_FILE_BYTES,
+        MAX_TOTAL_BYTES,
+        attachment_purge_loop,
+    )
 try:  # Package import in the repository; top-level import on installed VMs.
     from .clarify_state import (
         ClarifyState,
@@ -50,6 +68,8 @@ try:  # Package import in the repository; top-level import on installed VMs.
         encode_error_chunk,
         encode_terminal_chunk,
         normalize_model_for_session,
+        session_switch_command,
+        validate_config_set_result,
         PENDING_KEY_LIMIT,
         SEMAPHORE_ACQUIRE_TIMEOUT,
         HARD_MAX_STREAM_LIFETIME_SECONDS,
@@ -75,6 +95,8 @@ except ImportError:  # pragma: no cover - deployment layout
         encode_error_chunk,
         encode_terminal_chunk,
         normalize_model_for_session,
+        session_switch_command,
+        validate_config_set_result,
         PENDING_KEY_LIMIT,
         SEMAPHORE_ACQUIRE_TIMEOUT,
         HARD_MAX_STREAM_LIFETIME_SECONDS,
@@ -86,6 +108,10 @@ except ImportError:  # pragma: no cover - deployment layout
     )
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+try:
+    from .multipart_uploads import select_uploads
+except ImportError:  # pragma: no cover - deployment layout
+    from multipart_uploads import select_uploads  # type: ignore[assignment]
 
 
 PUBLIC_PREFIX: Final = "/hermes-classroom"
@@ -93,6 +119,12 @@ HERMES_BASE: Final = os.environ.get("HERMES_LOCAL_URL", "http://127.0.0.1:8642")
 HERMES_ENV: Final = Path(os.environ.get("HERMES_ENV_FILE", "/home/ubuntu/.hermes/hermes-serve.env"))
 SHARED_SECRET: Final = os.environ["HERMES_CLASSROOM_SHARED_SECRET"].encode("ascii")
 MAX_BODY: Final = 1_048_576
+# Bounded multipart framing allowance above the 10 MiB attachment content
+# policy (attachments.MAX_TOTAL_BYTES) so multipart boundaries/headers never
+# consume content budget. This stays far below the framework transport
+# ceiling so vinext/next does not reject uploads before this service.
+MULTIPART_FRAMING_ALLOWANCE: Final = 64 * 1024
+MAX_FILE_REQUEST_BODY: Final = MAX_TOTAL_BYTES + MULTIPART_FRAMING_ALLOWANCE
 MAX_CLOCK_SKEW: Final = 60
 NONCE_TTL: Final = 300
 NONCE_LIMIT: Final = 10_000
@@ -123,6 +155,7 @@ _idempotency = TurnIdempotency(ttl_seconds=15 * 60, limit=64)
 # In-flight streaming key tracking: prevents duplicate agent turns for streaming requests
 _inflight_stream_keys: set[str] = set()
 _inflight_stream_lock = asyncio.Lock()
+_attachment_registry = AttachmentRegistry(Path(os.environ.get("HERMES_ATTACHMENT_DIR", "/var/lib/hermes-classroom-connector/attachments")))
 
 
 def _dashboard_token() -> str:
@@ -164,11 +197,11 @@ async def _consume_nonce(nonce: str) -> bool:
         return True
 
 
-async def _authenticate(method: str, path: str, headers, body: bytes) -> None:
+async def _authenticate(method: str, path: str, headers, body: bytes, max_body: int = MAX_BODY) -> None:
     timestamp = headers.get("x-hermes-classroom-timestamp", "")
     nonce = headers.get("x-hermes-classroom-nonce", "")
     signature = headers.get("x-hermes-classroom-signature", "")
-    if len(body) > MAX_BODY or not NONCE_RE.fullmatch(nonce):
+    if len(body) > max_body or not NONCE_RE.fullmatch(nonce):
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         issued = int(timestamp)
@@ -223,6 +256,40 @@ async def _abacus_credits() -> dict:
                 pass
         _usage_cache.update({"expires": time.monotonic() + 30, "value": result})
         return result
+
+
+_snapshot_cache: dict[str, object] = {"expires": 0.0, "value": None}
+_snapshot_lock = asyncio.Lock()
+
+
+async def _abacus_snapshot() -> dict:
+    """Return a bounded, sanitized per-user Abacus credit snapshot.
+
+    The byUser:true log has no date field; the Abacus org compute-point log
+    is a rolling ~30-day window by contract, so the snapshot period is
+    ``rolling_30d`` (never calendar-month). Usernames and non-RouteLLM
+    buckets are dropped; only normalized emails plus RouteLLM/total credits
+    leave the VM, along with a fetch timestamp for freshness.
+    """
+    async with _snapshot_lock:
+        cached = _snapshot_cache.get("value")
+        if isinstance(cached, dict) and time.monotonic() < float(_snapshot_cache["expires"]):  # type: ignore[arg-type]
+            return cached
+        headers = {"Authorization": f"Bearer {_abacus_api_key()}", "Content-Type": "application/json"}
+        timeout = httpx.Timeout(connect=3.0, read=10.0, write=5.0, pool=3.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            by_user_response = await client.post("https://api.abacus.ai/api/v0/_getOrganizationComputePointLog", headers=headers, json={"byLlm": False, "byUser": True})
+            by_user_response.raise_for_status()
+            daily_response = await client.post("https://api.abacus.ai/api/v0/_getOrganizationComputePointLog", headers=headers, json={"byLlm": False, "byUser": False})
+            daily_response.raise_for_status()
+        payload = build_by_user_snapshot(
+            by_user_response.json(),
+            daily_response.json(),
+            generated_at_ms=int(time.time() * 1000),
+            today=datetime.now(timezone.utc).date().isoformat(),
+        )
+        _snapshot_cache.update({"expires": time.monotonic() + 60, "value": payload})
+        return payload
 
 
 MODEL_ID_RE: Final = re.compile(r"^(?=.{1,128}$)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
@@ -341,6 +408,29 @@ def _safe_history(messages: object) -> list[dict]:
     return sanitize_history(messages, MAX_BODY)
 
 
+def _attachment_prompt(payload: dict) -> tuple[str, list[Path]]:
+    raw = payload.get("attachments", [])
+    if raw is None:
+        return "", []
+    if not isinstance(raw, list) or len(raw) > MAX_FILES:
+        raise ValueError("attachments must contain at most three files")
+    try:
+        requests: list[tuple[str, str | None]] = []
+        for item in raw:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                raise ValueError("invalid attachment")
+            requests.append((item["id"], item.get("name")))
+        paths = _attachment_registry.resolve_and_consume_batch(requests)
+    except (AttachmentRejected, ValueError) as exc:
+        raise ValueError("attachment is unknown, expired, or already consumed") from exc
+    if not paths:
+        return "", []
+    manifest = ["\n\n--- ATTACHMENTS AVAILABLE ON THIS VM ---"]
+    manifest.extend(f"[{index}] {item_name}: {path}" for index, (item_name, path) in enumerate(paths, 1))
+    manifest.append("--- END ATTACHMENTS ---")
+    return "".join(manifest), [path for _, path in paths]
+
+
 def _safe_session_rows(rows: object) -> list[dict]:
     if not isinstance(rows, list):
         return []
@@ -364,6 +454,25 @@ def _safe_session_rows(rows: object) -> list[dict]:
             message_count = 0
         sanitized.append({"id": session_id, "title": title, "preview": preview, "started_at": started_at, "message_count": message_count})
     return sanitized
+
+
+async def _rpc_send_wait(upstream, recv_frame, frame: dict, *, error_message: str = "Hermes rejected the session request") -> dict:
+    """Send one JSON-RPC request and wait for its matching response frame.
+
+    Unrelated frames are skipped so this is safe mid-stream, and an RPC error
+    (or a non-dict result) raises rather than silently continuing.
+    """
+    await upstream.send(json.dumps(frame))
+    while True:
+        response = await recv_frame()
+        if response.get("id") != frame["id"]:
+            continue
+        if "error" in response:
+            raise RuntimeError(error_message)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("Hermes returned an invalid session response")
+        return result
 
 
 async def _rpc_chat(session_key: str | None, prompt: str, model: str | None = None) -> tuple[str, dict, str]:
@@ -428,6 +537,11 @@ async def _rpc_chat(session_key: str | None, prompt: str, model: str | None = No
             stored_session_id = str(result.get("session_key") or result.get("stored_session_id") or session_key or "")
             if not session_id or not stored_session_id:
                 raise RuntimeError("Hermes returned an invalid session response")
+        if session_key and model:
+            switch_frame = session_switch_command(session_id, model, f"model-{request_id}")
+            if switch_frame is not None:
+                switch_result = await _rpc_send_wait(upstream, recv_frame, switch_frame, error_message="Hermes could not switch session model")
+                validate_config_set_result(switch_result, requested_model=model)
         await upstream.send(json.dumps({"jsonrpc": "2.0", "id": prompt_id, "method": "prompt.submit", "params": {"session_id": session_id, "text": prompt}}))
         submitted = False
         while True:
@@ -550,7 +664,13 @@ async def _with_resumed_session(session_key: str, action: str, params: dict) -> 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
+    purge_task = asyncio.create_task(attachment_purge_loop(_attachment_registry))
+    try:
+        yield
+    finally:
+        purge_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await purge_task
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -590,6 +710,39 @@ async def capabilities(request: Request):
     }
 
 
+@app.post(f"{PUBLIC_PREFIX}/v1/files")
+async def upload_files(request: Request):
+    body = await request.body()
+    await _authenticate(request.method, request.url.path, request.headers, body, MAX_FILE_REQUEST_BODY)
+    content_type = request.headers.get("content-type", "")
+    if not content_type.lower().startswith("multipart/form-data;"):
+        return JSONResponse(status_code=415, content={"error": "multipart/form-data is required"})
+    try:
+        form = await request.form()
+        uploads = select_uploads(value for _, value in form.multi_items())
+        if not uploads or len(uploads) > MAX_FILES:
+            raise AttachmentRejected("up to three non-empty files are required")
+        contents: list[tuple[str, bytes]] = []
+        total = 0
+        for upload in uploads:
+            data = await upload.read(MAX_FILE_BYTES + 1)
+            if not data or len(data) > MAX_FILE_BYTES:
+                raise AttachmentRejected("attachment limits exceeded")
+            total += len(data)
+            if total > MAX_TOTAL_BYTES:
+                raise AttachmentRejected("attachment limits exceeded")
+            contents.append((upload.filename or "", data))
+        results = _attachment_registry.store_batch(contents)
+        return {"attachments": results}
+    except AttachmentRejected as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except (RuntimeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "Invalid multipart upload"})
+    finally:
+        for upload in locals().get("uploads", []):
+            await upload.close()
+
+
 @app.api_route(f"{PUBLIC_PREFIX}/v1/models", methods=["GET"])
 async def list_models(request: Request):
     body = await request.body()
@@ -605,6 +758,17 @@ async def usage_credits(request: Request):
         return await _abacus_credits()
     except (httpx.HTTPError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return JSONResponse(status_code=503, content={"error": "Abacus credit reporting is unavailable"})
+
+
+@app.api_route(f"{PUBLIC_PREFIX}/v1/abacus/snapshot", methods=["GET"])
+async def abacus_snapshot(request: Request):
+    """Portal-only per-user usage snapshot; never relayed to student browsers."""
+    body = await request.body()
+    await _authenticate(request.method, request.url.path, request.headers, body)
+    try:
+        return await _abacus_snapshot()
+    except (httpx.HTTPError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return JSONResponse(status_code=503, content={"error": "Abacus usage snapshot is unavailable"})
 
 
 @app.get(f"{PUBLIC_PREFIX}/v1/sessions")
@@ -684,6 +848,8 @@ async def _chat_completions_streaming(payload: dict, request: Request) -> Stream
     idempotency_key = str(payload.get("idempotency_key") or "").strip()
     if not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
         raise ValueError("a valid idempotency key is required")
+    attachment_prompt, attachment_paths = _attachment_prompt(payload)
+    prompt += attachment_prompt
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
 
     async def event_generator():
@@ -776,6 +942,12 @@ async def _chat_completions_streaming(payload: dict, request: Request) -> Stream
                         stored_session_id = str(result.get("session_key") or result.get("stored_session_id") or session_key or "")
                         if not session_id_val or not stored_session_id:
                             raise RuntimeError("Hermes returned an invalid session response")
+
+                    if session_key and model:
+                        switch_frame = session_switch_command(session_id_val, model, f"model-{request_id}")
+                        if switch_frame is not None:
+                            switch_result = await _rpc_send_wait(upstream, recv_frame, switch_frame, error_message="Hermes could not switch session model")
+                            validate_config_set_result(switch_result, requested_model=model)
 
                     await upstream.send(json.dumps({"jsonrpc": "2.0", "id": prompt_id, "method": "prompt.submit", "params": {"session_id": session_id_val, "text": prompt}}))
                     submitted = False
@@ -951,6 +1123,8 @@ async def _chat_completions_streaming(payload: dict, request: Request) -> Stream
         finally:
             async with _inflight_stream_lock:
                 _inflight_stream_keys.discard(idempotency_key)
+            for path in attachment_paths:
+                _attachment_registry.cleanup(path)
 
     return StreamingResponse(
         event_generator(),
@@ -990,13 +1164,19 @@ async def chat_completions(request: Request):
             raise ValueError("a valid idempotency key is required")
         model_raw = str(payload.get("model") or "").strip()
         model = normalize_model_for_session(session_key, model_raw if model_raw else None)
+        attachment_prompt, attachment_paths = _attachment_prompt(payload)
+        prompt += attachment_prompt
         fingerprint = hashlib.sha256(f"{session_key or ''}\0{prompt}".encode("utf-8")).hexdigest()
         async def run_turn():
             async with _turn_semaphore:
                 return await _rpc_chat(session_key, prompt, model=model)
         # Serialize by default: retrying browser/portal requests must not start
         # multiple expensive agent turns on a student's single VM.
-        answer, usage, stored_session_id = await _idempotency.run(idempotency_key, fingerprint, run_turn)
+        try:
+            answer, usage, stored_session_id = await _idempotency.run(idempotency_key, fingerprint, run_turn)
+        finally:
+            for path in attachment_paths:
+                _attachment_registry.cleanup(path)
     except ValueError as exc:
         return _openai_error(str(exc))
     except TimeoutError:

@@ -7,6 +7,7 @@ without FastAPI / websockets / HTTPX dependencies.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterator
 
 try:  # Package import during tests; top-level import when installed as connector scripts.
@@ -31,9 +32,68 @@ ALLOWED_ERROR_MESSAGES: frozenset = frozenset({
     GENERIC_INCOMPLETE_MESSAGE,
 })
 
+# Safe alphabet for a requested RouteLLM model id (letters, digits, slash,
+# dot, hyphen, underscore, colon, plus) with a hard length bound.  The id is
+# embedded verbatim into a Hermes config value, so whitespace, separators, and
+# flag syntax must never reach that string.
+SESSION_SWITCH_MODEL_RE = re.compile(r"^[A-Za-z0-9._:+/-]{1,128}$")
+
 
 def normalize_model_for_session(session_key: str | None, model: str | None) -> str | None:
-    return None if session_key else model
+    """Return the exact requested model id, or None when none was requested.
+
+    The requested model is now applied to resumed sessions as well as new
+    ones (via a session-scoped ``config.set`` switch before ``prompt.submit``),
+    so it is preserved instead of discarded when a session key is present.
+    """
+    return model or None
+
+
+def session_switch_command(session_id: str, model: str | None, request_id: str) -> dict | None:
+    """Build the ``config.set`` frame that switches the ephemeral session's model.
+
+    Returns ``None`` when no model was requested so callers can skip the
+    switch entirely.  The model id is validated *before* it is embedded into
+    the command, so whitespace/flag injection is impossible.  The ``--session``
+    flag scopes the change to the ephemeral resumed session instead of writing
+    the global Hermes config.
+    """
+    if model is None:
+        return None
+    if not SESSION_SWITCH_MODEL_RE.fullmatch(model):
+        raise ValueError("invalid model id")
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "config.set",
+        "params": {
+            "session_id": session_id,
+            "key": "model",
+            "value": f"{model} --session",
+            "confirm_expensive_model": True,
+        },
+    }
+
+
+def validate_config_set_result(result: Any, *, requested_model: str) -> None:
+    """Validate the ``config.set`` result before the connector submits a prompt.
+
+    The result must prove the ephemeral session's model actually switched to
+    the exact requested id.  ``deferred`` is accepted because Hermes applies a
+    session-scoped ``config.set`` at next-turn start; a truthy
+    ``confirm_required`` means the switch did not take effect.  Any mismatch
+    raises a generic ``ValueError`` whose text never embeds upstream data, so
+    a broken or future gateway cannot make the connector submit a prompt
+    without a confirmed switch.
+    """
+    if not isinstance(result, dict):
+        raise ValueError("Hermes did not confirm the model switch")
+    if result.get("key") != "model":
+        raise ValueError("Hermes did not confirm the model switch")
+    if result.get("value") != requested_model:
+        raise ValueError("Hermes did not confirm the model switch")
+    if result.get("confirm_required"):
+        raise ValueError("Hermes did not confirm the model switch")
 
 
 def completion_text_fallback(payload: dict, *, saw_text_delta: bool) -> str:

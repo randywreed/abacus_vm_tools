@@ -1,98 +1,292 @@
 #!/usr/bin/env bash
-#
-# Hermes Classroom — Connector Registration
-#
-# Sends your VM's hostname and connector secret to the course portal
-# using a one-time enrollment token. The portal encrypts your secret
-# and never returns it.
-#
-# Usage:
-#   ./register.sh <portal-url> <enrollment-token>
-#
-# Example:
-#   ./register.sh http://localhost:3002 abc123def456...
-#
-set -euo pipefail
 
-BOLD='\033[1m'
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+set -u
+umask 077
 
-ok()   { echo -e "${GREEN}✓${NC} $1"; }
-fail() { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
+usage() {
+    printf '%s\n' 'Usage: register.sh [PORTAL_HTTPS_ORIGIN]' >&2
+}
 
-PORTAL_URL="${1:?Usage: register.sh <portal-url> <enrollment-token>}"
-ENROLLMENT_TOKEN="${2:?Usage: register.sh <portal-url> <enrollment-token>}"
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
 
-# The VM must reach the portal over the network. localhost refers to the VM
-# running this script, not the student's browser or the instructor's machine.
-PORTAL_HOST="${PORTAL_URL#*://}"
-PORTAL_HOST="${PORTAL_HOST%%/*}"
-PORTAL_HOST="${PORTAL_HOST%%:*}"
-case "${PORTAL_HOST,,}" in
-  localhost|127.0.0.1|0.0.0.0|::1)
-    fail "Portal URL ${PORTAL_URL} points to localhost. Run this from the VM with the publicly reachable course portal URL, not your computer's localhost URL."
-    ;;
-esac
+interrupted() {
+    printf '\n%s\n' 'Registration interrupted.' >&2
+    exit 130
+}
+trap interrupted INT TERM HUP
 
-CONFIG_FILE="/etc/hermes-classroom-connector/connector.env"
-
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  fail "Connector config not found. Run install.sh first."
+if (( $# > 1 )); then
+    usage
+    exit 1
 fi
 
-CONNECTOR_SECRET="$(grep HERMES_CLASSROOM_SHARED_SECRET= "$CONFIG_FILE" | cut -d= -f2)"
-if [[ -z "$CONNECTOR_SECRET" ]]; then
-  fail "Could not read connector secret from $CONFIG_FILE"
+portal=${1-}
+if [[ -z $portal ]]; then
+    if [[ ! -t 0 ]]; then
+        usage
+        exit 1
+    fi
+    printf '%s' 'Portal HTTPS origin: ' >&2
+    if ! IFS= read -r portal; then
+        fail 'Portal origin was not provided.'
+    fi
 fi
 
-# Auto-detect hostname from Abacus metadata or derive from instance
-VM_ID="$(curl -sf --max-time 5 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
-if [[ -z "$VM_ID" ]]; then
-  VM_ID="$(hostname -f 2>/dev/null | grep -oP '^\d+' || true)"
-fi
-if [[ -z "$VM_ID" ]]; then
-  read -rp "Enter your VM's public hostname or ID (e.g. 123456789 or 123456789.abacusai.cloud): " VM_ID
+if ! portal=$(python3 - "$portal" <<'PY'
+import ipaddress
+import re
+import sys
+
+value = sys.argv[1]
+match = re.fullmatch(r"https://([^/]+)/?", value, re.IGNORECASE | re.ASCII)
+if not match:
+    raise SystemExit(1)
+host = match.group(1).lower()
+label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+if len(host) > 253 or not re.fullmatch(rf"{label}(?:\.{label})*", host, re.ASCII):
+    raise SystemExit(1)
+try:
+    ipaddress.ip_address(host)
+except ValueError:
+    pass
+else:
+    raise SystemExit(1)
+print("https://" + host)
+PY
+); then
+    fail 'Invalid portal HTTPS origin.'
 fi
 
-# Normalize manual input: accept a bare ID, hostname, or full URL.
-#   https://4100ca910.abacusai.cloud/
-#   4100ca910.abacusai.cloud
-#   4100ca910
-# all become 4100ca910.abacusai.cloud
-if [[ "$VM_ID" =~ ^https?:// ]]; then
-  VM_ID="${VM_ID#*://}"
+test_mode=0
+if [[ ${HERMES_CLASSROOM_REGISTER_TEST-} == 1 ]]; then
+    test_mode=1
 fi
-VM_ID="${VM_ID%%/*}"
-VM_ID="${VM_ID%%:*}"
-if [[ "$VM_ID" == *.abacusai.cloud ]]; then
-  CONNECTOR_HOSTNAME="$VM_ID"
+
+config_path=/etc/hermes-classroom-connector/connector.env
+curl_bin=curl
+host_candidate=
+if (( test_mode )); then
+    config_path=${HERMES_CLASSROOM_REGISTER_CONFIG:-$config_path}
+    curl_bin=${HERMES_CLASSROOM_REGISTER_CURL:-$curl_bin}
+    host_candidate=${HERMES_CLASSROOM_REGISTER_HOSTNAME-}
+fi
+
+[[ -f $config_path ]] || fail 'Connector configuration is unavailable.'
+if ! connector_secret=$(python3 - "$config_path" <<'PY'
+import re
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as stream:
+        data = stream.read(16385)
+except OSError:
+    raise SystemExit(1)
+if len(data) > 16384:
+    raise SystemExit(1)
+key = b"HERMES_CLASSROOM_SHARED_SECRET"
+candidates = []
+for line in data.splitlines():
+    stripped = line.lstrip()
+    if (stripped == key or stripped.startswith(key + b"=") or
+            stripped.startswith(key + b" ") or stripped.startswith(key + b"\t")):
+        candidates.append(line)
+if len(candidates) != 1:
+    raise SystemExit(1)
+match = re.fullmatch(rb"HERMES_CLASSROOM_SHARED_SECRET=([0-9a-f]{64})", candidates[0])
+if match is None:
+    raise SystemExit(1)
+sys.stdout.buffer.write(match.group(1))
+PY
+); then
+    fail 'Connector configuration is invalid.'
+fi
+
+normalize_host() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import re
+import sys
+
+value = sys.argv[1]
+url = re.fullmatch(r"https://([^/]+)/?", value, re.IGNORECASE | re.ASCII)
+if url:
+    host = url.group(1).lower()
+elif re.fullmatch(r"[^/]+", value, re.ASCII):
+    host = value.lower()
+else:
+    raise SystemExit(1)
+label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+if "." not in host:
+    if not re.fullmatch(label, host, re.ASCII):
+        raise SystemExit(1)
+    host += ".abacusai.cloud"
+if len(host) > 253 or not re.fullmatch(rf"{label}(?:\.{label})+", host, re.ASCII):
+    raise SystemExit(1)
+try:
+    ipaddress.ip_address(host)
+except ValueError:
+    pass
+else:
+    raise SystemExit(1)
+print(host)
+PY
+}
+
+connector_hostname=
+if [[ -n $host_candidate ]]; then
+    connector_hostname=$(normalize_host "$host_candidate") || fail 'Invalid connector hostname.'
 else
-  CONNECTOR_HOSTNAME="${VM_ID}.abacusai.cloud"
+    metadata_host=
+    if command -v curl >/dev/null 2>&1; then
+        metadata_host=$(curl --silent --fail --connect-timeout 1 --max-time 2 \
+            --noproxy '*' \
+            'http://169.254.169.254/latest/meta-data/instance-id' 2>/dev/null) || metadata_host=
+    fi
+    if [[ -n $metadata_host ]]; then
+        connector_hostname=$(normalize_host "$metadata_host") || connector_hostname=
+    fi
+    if [[ -z $connector_hostname ]] && command -v curl >/dev/null 2>&1; then
+        metadata_host=$(curl --silent --fail --connect-timeout 1 --max-time 2 \
+            --noproxy '*' \
+            --header 'Metadata-Flavor: Google' \
+            'http://metadata.google.internal/computeMetadata/v1/instance/hostname' 2>/dev/null) || metadata_host=
+        if [[ -n $metadata_host ]]; then
+            connector_hostname=$(normalize_host "$metadata_host") || connector_hostname=
+        fi
+    fi
+    if [[ -z $connector_hostname ]]; then
+        system_host=$(hostname -f 2>/dev/null) || system_host=$(hostname 2>/dev/null) || system_host=
+        if [[ -n $system_host ]]; then
+            connector_hostname=$(normalize_host "$system_host") || connector_hostname=
+        fi
+    fi
+    if [[ -z $connector_hostname && -t 0 ]]; then
+        printf '%s' 'Connector hostname: ' >&2
+        if IFS= read -r host_candidate; then
+            connector_hostname=$(normalize_host "$host_candidate") || connector_hostname=
+        fi
+    fi
+    [[ -n $connector_hostname ]] || fail 'A valid connector hostname is required.'
 fi
 
-echo -e "${BOLD}Registering connector...${NC}"
-echo -e "  Portal:     ${CYAN}${PORTAL_URL}${NC}"
-echo -e "  Hostname:   ${CYAN}${CONNECTOR_HOSTNAME}${NC}"
-echo -e "  Token:      ${CYAN}${ENROLLMENT_TOKEN:0:12}...${NC}"
-echo
-
-RESPONSE_FILE="$(mktemp)"
-trap 'rm -f "$RESPONSE_FILE"' EXIT
-HTTP_STATUS="$(curl -sS --location --max-redirs 3 --proto-redir =http,https -o "$RESPONSE_FILE" -w '%{http_code}' -X POST "${PORTAL_URL}/api/connector/register" \
-  -H "Content-Type: application/json" \
-  -d "{\"enrollmentToken\": \"${ENROLLMENT_TOKEN}\", \"connectorHostname\": \"${CONNECTOR_HOSTNAME}\", \"connectorSecret\": \"${CONNECTOR_SECRET}\"}")" || fail "Could not reach the portal at ${PORTAL_URL}."
-RESPONSE="$(cat "$RESPONSE_FILE")"
-
-if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]] && echo "$RESPONSE" | grep -q '"ok":true'; then
-  ok "Connector registered successfully!"
-  echo
-  echo -e "${BOLD}Next step:${NC} Go back to the portal Workspace and click ${BOLD}Test connection${NC}."
+token=
+if [[ -t 0 ]]; then
+    printf '%s' 'Registration token: ' >&2
+    if ! IFS= read -r -s token; then
+        printf '\n' >&2
+        fail 'Registration token was not provided.'
+    fi
+    printf '\n' >&2
 else
-  if [[ -n "$RESPONSE" ]]; then
-    fail "Registration failed (HTTP ${HTTP_STATUS}): $RESPONSE"
-  fi
-  fail "Registration failed (HTTP ${HTTP_STATUS}); the portal returned no details."
+    if ! token=$(python3 -c 'import re
+import sys
+
+line = sys.stdin.buffer.readline(4098)
+if len(line) > 4097 or not line:
+    raise SystemExit(1)
+if line.endswith(b"\n"):
+    line = line[:-1]
+if line.endswith(b"\r") or sys.stdin.buffer.read(1):
+    raise SystemExit(1)
+if not 16 <= len(line) <= 4096:
+    raise SystemExit(1)
+if not re.fullmatch(rb"[A-Za-z0-9._~-]+", line):
+    raise SystemExit(1)
+sys.stdout.buffer.write(line)'
+    ); then
+        fail 'Invalid registration token.'
+    fi
 fi
+
+if (( ${#token} < 16 || ${#token} > 4096 )) || [[ ! $token =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    token=
+    fail 'Invalid registration token.'
+fi
+
+if [[ $curl_bin == */* ]]; then
+    [[ -x $curl_bin ]] || fail 'Registration client is unavailable.'
+else
+    curl_bin=$(command -v "$curl_bin") || fail 'Registration client is unavailable.'
+fi
+
+temp_dir=$(mktemp -d) || fail 'Unable to prepare registration request.'
+cleanup() {
+    token=
+    connector_secret=
+    rm -f -- "$temp_dir/request.json" "$temp_dir/response.json"
+    rmdir -- "$temp_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+request_file=$temp_dir/request.json
+response_file=$temp_dir/response.json
+
+if ! {
+    printf '%s\n' "$token"
+    printf '%s\n' "$connector_hostname"
+    printf '%s\n' "$connector_secret"
+} | python3 -c '
+import json
+import sys
+
+values = []
+for _ in range(3):
+    line = sys.stdin.buffer.readline(4098)
+    if not line.endswith(b"\n"):
+        raise SystemExit(1)
+    try:
+        values.append(line[:-1].decode("ascii"))
+    except UnicodeDecodeError:
+        raise SystemExit(1)
+if sys.stdin.buffer.read(1):
+    raise SystemExit(1)
+token, hostname, secret = values
+json.dump({
+    "enrollmentToken": token,
+    "connectorHostname": hostname,
+    "connectorSecret": secret,
+}, sys.stdout, separators=(",", ":"))
+' >"$request_file"; then
+    fail 'Unable to prepare registration request.'
+fi
+
+http_status=$(
+    "$curl_bin" \
+        --silent \
+        --request POST \
+        --proto '=https' \
+        --connect-timeout 10 \
+        --max-time 30 \
+        --max-filesize 65536 \
+        --header 'Content-Type: application/json' \
+        --data-binary "@$request_file" \
+        --output "$response_file" \
+        --write-out '%{http_code}' \
+        "$portal/api/connector/register" 2>/dev/null
+) || fail 'Registration request failed.'
+
+[[ $http_status =~ ^[0-9]{3}$ ]] || fail 'Registration request failed.'
+[[ $http_status =~ ^2[0-9][0-9]$ ]] || fail "Registration failed (HTTP $http_status)."
+[[ -f $response_file ]] || fail 'Registration response was invalid.'
+response_size=$(wc -c <"$response_file") || fail 'Registration response was invalid.'
+(( response_size <= 65536 )) || fail 'Registration response was too large.'
+
+if ! python3 - "$response_file" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as stream:
+        result = json.load(stream)
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if type(result) is not dict or result.get("ok") is not True:
+    raise SystemExit(1)
+PY
+then
+    fail 'Registration response was invalid.'
+fi
+
+printf 'Connector registered successfully for %s.\n' "$connector_hostname"
