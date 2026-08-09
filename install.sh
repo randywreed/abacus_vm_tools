@@ -39,6 +39,7 @@ SYSTEMD_DIR="/etc/systemd"
 SERVICE_USER="ubuntu"
 HERMES_ENV_FILE="/home/${SERVICE_USER}/.hermes/hermes-serve.env"
 ABACUS_PYTHON="/opt/abacus-python/bin/python"
+WEB_DEPLOYMENT_SKILL_SOURCE="${REPO_DIR}/skills/devops/abacus-vm-web-deployment/SKILL.md"
 
 # ── Test-mode guard / staged root ──────────────────────────────────────────
 STAGING=0
@@ -107,6 +108,12 @@ else
   USER_FLAGS=(-o "$SERVICE_OWNER" -g "$SERVICE_OWNER")
 fi
 
+if [[ "$STAGING" == "1" ]]; then
+  WEB_DEPLOYMENT_SKILL_ROOT="${STAGE_ROOT}/home/${SERVICE_USER}/.hermes/skills/devops/abacus-vm-web-deployment"
+else
+  WEB_DEPLOYMENT_SKILL_ROOT="/home/${SERVICE_USER}/.hermes/skills/devops/abacus-vm-web-deployment"
+fi
+
 # ── Shared runtime layout engine (production and --stage-root) ─────────────
 # Builds the complete connector runtime under the resolved prefixes using real
 # install(1) operations and permissions. Production installs under real /opt,
@@ -119,6 +126,7 @@ layout_connector_runtime() {
   # Early-fail: verify all required source files exist before installing any.
   local -a REQUIRED_SOURCES=(
     hermes_classroom_connector.py
+    app_tunnel.py
     abacus_usage.py
     telemetry.py
     idempotency.py
@@ -133,6 +141,8 @@ layout_connector_runtime() {
     hermes-classroom-serve.service
   )
   [[ -f "${REPO_DIR}/register.sh" ]] || fail "Required source file missing: ${REPO_DIR}/register.sh"
+  [[ -f "$WEB_DEPLOYMENT_SKILL_SOURCE" ]] \
+    || fail "Required skill file missing: ${WEB_DEPLOYMENT_SKILL_SOURCE}"
   local f
   for f in "${REQUIRED_SOURCES[@]}"; do
     if [[ ! -f "${CONNECTOR_SRC}/${f}" ]]; then
@@ -149,10 +159,14 @@ layout_connector_runtime() {
   done
 
   # Reviewed runtime modules: imported, never executed.
-  for f in attachments.py multipart_uploads.py; do
+  for f in attachments.py multipart_uploads.py app_tunnel.py; do
     install "${USER_FLAGS[@]}" -m 0644 \
       "${CONNECTOR_SRC}/${f}" "${INSTALL_ROOT}/${f}"
   done
+
+  install -d "${USER_FLAGS[@]}" -m 0755 "$WEB_DEPLOYMENT_SKILL_ROOT"
+  install "${USER_FLAGS[@]}" -m 0644 \
+    "$WEB_DEPLOYMENT_SKILL_SOURCE" "$WEB_DEPLOYMENT_SKILL_ROOT/SKILL.md"
 
   install "${ROOT_FLAGS[@]}" -m 0755 \
     "${REPO_DIR}/register.sh" "${INSTALL_ROOT}/register.sh"

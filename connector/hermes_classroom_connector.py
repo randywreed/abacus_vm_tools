@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Final
 from datetime import datetime, timezone
+from urllib.parse import quote_from_bytes
 
 import httpx
 import uvicorn
@@ -53,6 +54,11 @@ except ImportError:  # pragma: no cover - deployment layout
         attachment_purge_loop,
     )
 try:  # Package import in the repository; top-level import on installed VMs.
+    from .app_tunnel import (
+        AppTunnelRegistry,
+        validate_app_name,
+        validate_tunnel_port,
+    )
     from .clarify_state import (
         ClarifyState,
         CLARIFY_TTL_SECONDS,
@@ -80,6 +86,11 @@ try:  # Package import in the repository; top-level import on installed VMs.
         validate_completion_fallback_text,
     )
 except ImportError:  # pragma: no cover - deployment layout
+    from app_tunnel import (  # type: ignore[assignment]
+        AppTunnelRegistry,
+        validate_app_name,
+        validate_tunnel_port,
+    )
     from clarify_state import (  # type: ignore[assignment]
         ClarifyState,
         CLARIFY_TTL_SECONDS,
@@ -156,6 +167,30 @@ _idempotency = TurnIdempotency(ttl_seconds=15 * 60, limit=64)
 _inflight_stream_keys: set[str] = set()
 _inflight_stream_lock = asyncio.Lock()
 _attachment_registry = AttachmentRegistry(Path(os.environ.get("HERMES_ATTACHMENT_DIR", "/var/lib/hermes-classroom-connector/attachments")))
+# Student app tunnels: name -> loopback port, public under /hermes-classroom/apps/.
+# In-memory only; tunnels die with the VM, which is the intended sandbox lifecycle.
+_tunnel_registry = AppTunnelRegistry()
+# Bound public proxy concurrency and per-request buffering so a flood of
+# app-tunnel requests cannot exhaust connector memory.
+TUNNEL_MAX_BODY: Final = MAX_BODY
+_tunnel_proxy_semaphore = asyncio.Semaphore(8)
+
+
+def _is_loopback_admin_request(request: Request) -> bool:
+    """Allow tunnel management only from a direct loopback peer.
+
+    Nginx sets X-Real-IP / X-Forwarded-For / X-Forwarded-Proto on public
+    requests. Rejecting their presence prevents a public client from using the
+    registration API, while the peer check protects the gate if the service
+    bind is ever widened accidentally.
+    """
+    peer = request.client.host if request.client else ""
+    if peer not in ("127.0.0.1", "::1", "localhost"):
+        return False
+    for header in ("x-real-ip", "x-forwarded-for", "x-forwarded-proto"):
+        if header in request.headers:
+            return False
+    return True
 
 
 def _dashboard_token() -> str:
@@ -1236,6 +1271,192 @@ async def clarify_answer(request: Request):
     if not success:
         raise HTTPException(status_code=404, detail="Clarify token not found or expired")
     return {"status": "ok"}
+
+
+@app.post(f"{PUBLIC_PREFIX}/v1/apps")
+async def register_tunnel_app(request: Request):
+    """Register a loopback web app for public exposure under /apps/<name>/."""
+    if not _is_loopback_admin_request(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.body()
+    if len(body) > 4096:
+        raise HTTPException(status_code=400, detail="Body too large")
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("body must be an object")
+        name = data.get("name")
+        port = data.get("port")
+        if not isinstance(name, str):
+            raise ValueError("name must be a string")
+        if not isinstance(port, int) or isinstance(port, bool):
+            raise ValueError("port must be an integer")
+        valid_name = validate_app_name(name)
+        valid_port = validate_tunnel_port(port)
+        _tunnel_registry.register(valid_name, valid_port)
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "name": valid_name, "port": valid_port, "url": f"{PUBLIC_PREFIX}/apps/{valid_name}/"}
+
+
+@app.get(f"{PUBLIC_PREFIX}/v1/apps")
+async def list_tunnel_apps(request: Request):
+    """List registered app tunnels. Loopback-gated like registration."""
+    if not _is_loopback_admin_request(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return {
+        "apps": [
+            {"name": name, "port": port, "url": f"{PUBLIC_PREFIX}/apps/{name}/"}
+            for name, port in _tunnel_registry.list()
+        ]
+    }
+
+
+@app.delete(f"{PUBLIC_PREFIX}/v1/apps/{{name}}")
+async def delete_tunnel_app(request: Request, name: str):
+    """Remove an app tunnel. Loopback-gated like registration."""
+    if not _is_loopback_admin_request(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        valid_name = validate_app_name(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="App not found") from exc
+    if not _tunnel_registry.unregister(valid_name):
+        raise HTTPException(status_code=404, detail="App not found")
+    return {"ok": True, "name": valid_name}
+
+
+@app.api_route(
+    f"{PUBLIC_PREFIX}/apps/{{name}}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@app.api_route(
+    f"{PUBLIC_PREFIX}/apps/{{name}}/{{path:path}}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def tunnel_proxy(request: Request, name: str, path: str = ""):
+    """Public reverse proxy to a registered loopback app.
+
+    The target is always ``http://127.0.0.1:<registered port>``. There is no
+    host input, so this cannot be pointed at arbitrary internet hosts.
+    """
+    try:
+        port = _tunnel_registry.get(name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="App not found") from None
+    if port is None:
+        raise HTTPException(status_code=404, detail="App not found")
+
+    # Hold one slot until the upstream response stream is fully closed.  This
+    # bounds slow clients as well as request setup/body buffering.
+    await _tunnel_proxy_semaphore.acquire()
+    slot_released = False
+
+    def release_slot() -> None:
+        nonlocal slot_released
+        if not slot_released:
+            slot_released = True
+            _tunnel_proxy_semaphore.release()
+
+    client: httpx.AsyncClient | None = None
+    try:
+        raw_path = request.scope.get("raw_path") or request.url.path.encode("utf-8")
+        prefix = f"{PUBLIC_PREFIX}/apps/{name}".encode("utf-8")
+        if raw_path.startswith(prefix):
+            subpath = raw_path[len(prefix):]
+        else:
+            raise HTTPException(status_code=404, detail="App not found")
+        if not subpath:
+            subpath = b"/"
+        elif not subpath.startswith(b"/"):
+            # Encoded separators such as ``%2F`` can survive routing as the
+            # first raw byte after the app name; keep the upstream URL valid.
+            subpath = b"/" + subpath
+        raw_query = request.scope.get("query_string", b"")
+        # Preserve existing ASCII escapes and path delimiters while encoding
+        # raw non-ASCII bytes so httpx receives an unambiguous ASCII URL.
+        safe = "/%:@-._~!$&'()*+,;="
+        target = (
+            f"http://127.0.0.1:{port}"
+            + quote_from_bytes(subpath, safe=safe)
+            + ("?" + quote_from_bytes(raw_query, safe=safe) if raw_query else "")
+        )
+
+        hop_by_hop = {
+            "connection", "keep-alive", "transfer-encoding", "upgrade",
+            "proxy-authenticate", "proxy-authorization", "te", "trailer",
+        }
+        headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() not in hop_by_hop
+            and key.lower() not in ("host", "content-length", "x-forwarded-host")
+        }
+        public_host = request.headers.get("host", "")
+        if public_host:
+            headers["X-Forwarded-Host"] = public_host
+
+        declared_length = request.headers.get("content-length")
+        if declared_length:
+            try:
+                if int(declared_length) > TUNNEL_MAX_BODY:
+                    raise HTTPException(status_code=413, detail="Request body too large")
+            except ValueError:
+                pass
+        body_chunks: list[bytes] = []
+        body_size = 0
+        async for chunk in request.stream():
+            body_chunks.append(chunk)
+            body_size += len(chunk)
+            if body_size > TUNNEL_MAX_BODY:
+                raise HTTPException(status_code=413, detail="Request body too large")
+        body = b"".join(body_chunks)
+
+        timeout = httpx.Timeout(connect=5.0, read=300.0, write=60.0, pool=5.0)
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+        try:
+            upstream = await client.send(
+                client.build_request(request.method, target, headers=headers, content=body),
+                stream=True,
+            )
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+            raise HTTPException(status_code=502, detail="App is not reachable") from None
+
+        response_headers = {
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower() not in hop_by_hop and key.lower() != "content-length"
+        }
+
+        async def stream():
+            try:
+                async for chunk in upstream.aiter_raw():
+                    yield chunk
+            finally:
+                try:
+                    await upstream.aclose()
+                finally:
+                    try:
+                        await client.aclose()
+                    finally:
+                        release_slot()
+
+        try:
+            return StreamingResponse(
+                stream(),
+                status_code=upstream.status_code,
+                headers=response_headers,
+            )
+        except BaseException:
+            await upstream.aclose()
+            raise
+    except BaseException:
+        try:
+            if client is not None:
+                await client.aclose()
+        finally:
+            release_slot()
+        raise
 
 
 if __name__ == "__main__":

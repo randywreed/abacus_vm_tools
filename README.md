@@ -7,8 +7,10 @@ from that clone.
 ## What this does
 
 The installer places a secure connector between the course portal and Hermes
-running on the VM's loopback interface. The browser never receives the Hermes
-token, VM address, or connector shared secret.
+running on the VM's loopback interface. Connector control and chat traffic keep
+the Hermes token and connector shared secret out of the browser. Published web
+applications intentionally use the VM's own public HTTPS hostname, as described
+below.
 
 ```
 student browser → course portal (HTTPS) → your VM's Abacus hostname
@@ -24,6 +26,43 @@ The connector supports:
 - Streaming chat
 - Sessions
 - Clarification requests and responses
+
+## Publish web applications on this VM
+
+Every Abacus SuperComputer has its own public HTTPS hostname. The connector is
+also the per-VM router for multiple student web applications. An app running on
+`127.0.0.1:8767` and registered as `game` is available at:
+
+```text
+https://<this-vm-host>/hermes-classroom/apps/game/
+```
+
+For example, if the Abacus console identifies the VM as
+`4100ca910.abacusai.cloud`, the URL is:
+
+```text
+https://4100ca910.abacusai.cloud/hermes-classroom/apps/game/
+```
+
+The application must be an HTTP app, listen on an unprivileged loopback port,
+and be configured for the external base path
+`/hermes-classroom/apps/game/`. WebSocket upgrades are not supported by this
+router. The app path is public; do not publish secrets, debug consoles, or
+administrative controls through it.
+
+Register an app from inside the VM after its port is listening:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8765/hermes-classroom/v1/apps \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"game","port":8767}'
+```
+
+Registration, listing, and deletion are loopback-only. The connector supports
+up to eight named apps per VM; registrations are in-memory and must be repeated
+after a connector or VM restart. See the installed Hermes skill
+`abacus-vm-web-deployment` for the complete procedure, frontend base-path
+guidance, port restrictions, and verification checklist.
 
 ## Prerequisites
 

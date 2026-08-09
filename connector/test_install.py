@@ -26,6 +26,7 @@ SAFE_REGISTER_RETRY = (
 
 RUNTIME_FILES = [
     "hermes_classroom_connector.py",
+    "app_tunnel.py",
     "abacus_usage.py",
     "telemetry.py",
     "idempotency.py",
@@ -195,8 +196,23 @@ class TestStagedRuntimeLayout:
             target = install_root / name
             assert target.is_file(), f"missing staged runtime file: {target}"
 
-        for name in ("attachments.py", "multipart_uploads.py"):
+        for name in ("attachments.py", "multipart_uploads.py", "app_tunnel.py"):
             assert_mode(install_root / name, 0o644)
+        skill = (
+            stage_root
+            / "home"
+            / "ubuntu"
+            / ".hermes"
+            / "skills"
+            / "devops"
+            / "abacus-vm-web-deployment"
+            / "SKILL.md"
+        )
+        assert skill.is_file(), "missing installed web-deployment skill"
+        assert skill.read_bytes() == (
+            REPO_ROOT / "skills" / "devops" / "abacus-vm-web-deployment" / "SKILL.md"
+        ).read_bytes()
+        assert_mode(skill, 0o644)
         assert_mode(install_root / "patch_nginx_default.py", 0o755)
         assert_mode(install_root / "nginx-hermes-classroom.conf", 0o644)
 
