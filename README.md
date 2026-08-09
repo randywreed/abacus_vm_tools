@@ -60,9 +60,9 @@ curl -sS -X POST http://127.0.0.1:8765/hermes-classroom/v1/apps \
 
 Registration, listing, and deletion are loopback-only. The connector supports
 up to eight named apps per VM; registrations are in-memory and must be repeated
-after a connector or VM restart. See the installed Hermes skill
-`abacus-vm-web-deployment` for the complete procedure, frontend base-path
-guidance, port restrictions, and verification checklist.
+after a connector or VM restart. Tell the thread to use the installed Hermes
+skill `abacus-vm-web-app` for the complete implementation, startup,
+registration, frontend base-path, and verification procedure.
 
 ## Prerequisites
 

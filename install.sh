@@ -40,6 +40,7 @@ SERVICE_USER="ubuntu"
 HERMES_ENV_FILE="/home/${SERVICE_USER}/.hermes/hermes-serve.env"
 ABACUS_PYTHON="/opt/abacus-python/bin/python"
 WEB_DEPLOYMENT_SKILL_SOURCE="${REPO_DIR}/skills/devops/abacus-vm-web-deployment/SKILL.md"
+WEB_APP_SKILL_SOURCE="${REPO_DIR}/skills/devops/abacus-vm-web-app/SKILL.md"
 
 # ── Test-mode guard / staged root ──────────────────────────────────────────
 STAGING=0
@@ -110,8 +111,10 @@ fi
 
 if [[ "$STAGING" == "1" ]]; then
   WEB_DEPLOYMENT_SKILL_ROOT="${STAGE_ROOT}/home/${SERVICE_USER}/.hermes/skills/devops/abacus-vm-web-deployment"
+  WEB_APP_SKILL_ROOT="${STAGE_ROOT}/home/${SERVICE_USER}/.hermes/skills/devops/abacus-vm-web-app"
 else
   WEB_DEPLOYMENT_SKILL_ROOT="/home/${SERVICE_USER}/.hermes/skills/devops/abacus-vm-web-deployment"
+  WEB_APP_SKILL_ROOT="/home/${SERVICE_USER}/.hermes/skills/devops/abacus-vm-web-app"
 fi
 
 # ── Shared runtime layout engine (production and --stage-root) ─────────────
@@ -143,6 +146,8 @@ layout_connector_runtime() {
   [[ -f "${REPO_DIR}/register.sh" ]] || fail "Required source file missing: ${REPO_DIR}/register.sh"
   [[ -f "$WEB_DEPLOYMENT_SKILL_SOURCE" ]] \
     || fail "Required skill file missing: ${WEB_DEPLOYMENT_SKILL_SOURCE}"
+  [[ -f "$WEB_APP_SKILL_SOURCE" ]] \
+    || fail "Required skill file missing: ${WEB_APP_SKILL_SOURCE}"
   local f
   for f in "${REQUIRED_SOURCES[@]}"; do
     if [[ ! -f "${CONNECTOR_SRC}/${f}" ]]; then
@@ -167,6 +172,9 @@ layout_connector_runtime() {
   install -d "${USER_FLAGS[@]}" -m 0755 "$WEB_DEPLOYMENT_SKILL_ROOT"
   install "${USER_FLAGS[@]}" -m 0644 \
     "$WEB_DEPLOYMENT_SKILL_SOURCE" "$WEB_DEPLOYMENT_SKILL_ROOT/SKILL.md"
+  install -d "${USER_FLAGS[@]}" -m 0755 "$WEB_APP_SKILL_ROOT"
+  install "${USER_FLAGS[@]}" -m 0644 \
+    "$WEB_APP_SKILL_SOURCE" "$WEB_APP_SKILL_ROOT/SKILL.md"
 
   install "${ROOT_FLAGS[@]}" -m 0755 \
     "${REPO_DIR}/register.sh" "${INSTALL_ROOT}/register.sh"

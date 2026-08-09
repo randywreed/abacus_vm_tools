@@ -213,6 +213,21 @@ class TestStagedRuntimeLayout:
             REPO_ROOT / "skills" / "devops" / "abacus-vm-web-deployment" / "SKILL.md"
         ).read_bytes()
         assert_mode(skill, 0o644)
+        app_skill = (
+            stage_root
+            / "home"
+            / "ubuntu"
+            / ".hermes"
+            / "skills"
+            / "devops"
+            / "abacus-vm-web-app"
+            / "SKILL.md"
+        )
+        assert app_skill.is_file(), "missing installed web-app implementation skill"
+        assert app_skill.read_bytes() == (
+            REPO_ROOT / "skills" / "devops" / "abacus-vm-web-app" / "SKILL.md"
+        ).read_bytes()
+        assert_mode(app_skill, 0o644)
         assert_mode(install_root / "patch_nginx_default.py", 0o755)
         assert_mode(install_root / "nginx-hermes-classroom.conf", 0o644)
 
