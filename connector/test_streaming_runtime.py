@@ -152,6 +152,36 @@ class ConstantsExistenceTests(unittest.TestCase):
         self.assertIsInstance(HARD_MAX_STREAM_LIFETIME_SECONDS, (int, float))
         self.assertGreater(HARD_MAX_STREAM_LIFETIME_SECONDS, 0)
 
+    def test_chat_timeout_defaults_to_hard_stream_lifetime(self):
+        from connector import streaming_sse
+
+        timeout_helper = getattr(streaming_sse, "bounded_chat_timeout_seconds", None)
+        if not callable(timeout_helper):
+            self.fail("bounded_chat_timeout_seconds is missing")
+        self.assertEqual(
+            timeout_helper(None),
+            streaming_sse.HARD_MAX_STREAM_LIFETIME_SECONDS,
+        )
+
+    def test_chat_timeout_override_cannot_exceed_hard_stream_lifetime(self):
+        from connector.streaming_sse import (
+            HARD_MAX_STREAM_LIFETIME_SECONDS,
+            bounded_chat_timeout_seconds,
+        )
+
+        self.assertEqual(
+            bounded_chat_timeout_seconds("1200"),
+            HARD_MAX_STREAM_LIFETIME_SECONDS,
+        )
+
+    def test_chat_timeout_rejects_invalid_values_as_runtime_configuration_errors(self):
+        from connector.streaming_sse import bounded_chat_timeout_seconds
+
+        for raw_value in ("0", "-30", "nan", "inf", "-inf", "", "bogus"):
+            with self.subTest(raw_value=raw_value):
+                with self.assertRaises(RuntimeError):
+                    bounded_chat_timeout_seconds(raw_value)
+
     def test_max_utf8_delta_bytes_exists(self):
         from connector.streaming_sse import MAX_UTF8_DELTA_BYTES
         self.assertIsInstance(MAX_UTF8_DELTA_BYTES, int)
@@ -205,6 +235,12 @@ class ConnectorImportsConstantsTests(unittest.TestCase):
         event_gen_idx = source.index("async def event_generator")
         after_def = source[event_gen_idx:]
         self.assertIn("min(timeout, HARD_MAX_STREAM_LIFETIME_SECONDS)", after_def)
+
+    def test_both_chat_paths_use_the_bounded_timeout_helper(self):
+        source = self._source()
+        expected_call = 'bounded_chat_timeout_seconds(os.environ.get("HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS"))'
+        self.assertEqual(source.count(expected_call), 2)
+        self.assertNotIn('HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS", "300"', source)
 
     def test_connector_no_accumulated_text(self):
         source = self._source()

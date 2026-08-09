@@ -7,6 +7,7 @@ without FastAPI / websockets / HTTPX dependencies.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Iterator
 
@@ -21,6 +22,19 @@ SEMAPHORE_ACQUIRE_TIMEOUT: float = 60.0
 HARD_MAX_STREAM_LIFETIME_SECONDS: float = 600.0
 MAX_UTF8_DELTA_BYTES: int = 512_000
 MAX_TERMINAL_ENCODED_BYTES: int = 1_048_576
+
+
+def bounded_chat_timeout_seconds(raw_value: str | None) -> float:
+    """Return the configured chat timeout capped by the stream safety limit."""
+    if raw_value is None:
+        return HARD_MAX_STREAM_LIFETIME_SECONDS
+    try:
+        configured = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("invalid connector chat timeout") from exc
+    if not math.isfinite(configured) or configured <= 0:
+        raise RuntimeError("invalid connector chat timeout")
+    return min(configured, HARD_MAX_STREAM_LIFETIME_SECONDS)
 
 GENERIC_TIMEOUT_MESSAGE = "Hermes timed out"
 GENERIC_UNAVAILABLE_MESSAGE = "Hermes is unavailable"

@@ -68,6 +68,7 @@ try:  # Package import in the repository; top-level import on installed VMs.
         validate_choices,
     )
     from .streaming_sse import (
+        bounded_chat_timeout_seconds,
         completion_text_fallback,
         encode_clarify_chunk,
         encode_delta_chunk,
@@ -100,6 +101,7 @@ except ImportError:  # pragma: no cover - deployment layout
         validate_choices,
     )
     from streaming_sse import (  # type: ignore[assignment]
+        bounded_chat_timeout_seconds,
         completion_text_fallback,
         encode_clarify_chunk,
         encode_delta_chunk,
@@ -523,7 +525,7 @@ async def _rpc_chat(session_key: str | None, prompt: str, model: str | None = No
     durable session history separately in its state DB.
     """
     token = _dashboard_token()
-    timeout = float(os.environ.get("HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS", "300"))
+    timeout = bounded_chat_timeout_seconds(os.environ.get("HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS"))
     request_id = uuid.uuid4().hex
     create_id = f"create-{request_id}"
     prompt_id = f"prompt-{request_id}"
@@ -900,7 +902,7 @@ async def _chat_completions_streaming(payload: dict, request: Request) -> Stream
                 _inflight_stream_keys.add(idempotency_key)
 
             token = _dashboard_token()
-            timeout = float(os.environ.get("HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS", "300"))
+            timeout = bounded_chat_timeout_seconds(os.environ.get("HERMES_CLASSROOM_CHAT_TIMEOUT_SECONDS"))
             deadline = time.monotonic() + min(timeout, HARD_MAX_STREAM_LIFETIME_SECONDS)
 
             try:
