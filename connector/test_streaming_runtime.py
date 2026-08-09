@@ -311,15 +311,17 @@ class ConnectorImportsConstantsTests(unittest.TestCase):
         # The fallback text must be UTF-8 byte capped
         self.assertIn("MAX_UTF8_DELTA_BYTES", handler)
 
-    def test_connector_cancelled_error_does_not_yield(self):
+    def test_connector_cancelled_error_yields_unavailable_chunk(self):
+        """CancelledError handler must yield a generic unavailable error chunk
+        (+ [DONE]) before re-raising, so the relay sees a well-formed SSE
+        termination instead of a raw stream close."""
         source = self._source()
         event_gen_idx = source.index("async def event_generator")
         after_def = source[event_gen_idx:]
-        self.assertNotIn("yield encode_error_chunk", after_def.rsplit("except asyncio.CancelledError", 1)[0])
-        # CancelledError handler must only raise, never yield
         cancelled_idx = after_def.index("except asyncio.CancelledError")
-        cancelled_block = after_def[cancelled_idx:cancelled_idx + 80]
-        self.assertNotIn("yield", cancelled_block)
+        cancelled_block = after_def[cancelled_idx:cancelled_idx + 800]
+        self.assertIn("yield encode_error_chunk", cancelled_block)
+        self.assertIn("GENERIC_UNAVAILABLE_MESSAGE", cancelled_block)
         self.assertIn("raise", cancelled_block)
         # Cleanup must remain in finally
         self.assertIn("finally:", after_def)

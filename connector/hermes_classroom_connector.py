@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -142,6 +143,9 @@ MAX_CLOCK_SKEW: Final = 60
 NONCE_TTL: Final = 300
 NONCE_LIMIT: Final = 10_000
 NONCE_RE: Final = re.compile(r"^[A-Za-z0-9_-]{22,128}$")
+
+logger = logging.getLogger("hermes_classroom_connector")
+
 IDEMPOTENCY_KEY_RE: Final = re.compile(r"^[A-Za-z0-9_-]{22,128}$")
 try:
     MAX_CONCURRENT_TURNS: Final = max(1, int(os.environ.get("HERMES_CLASSROOM_MAX_CONCURRENT_TURNS", "1")))
@@ -933,6 +937,11 @@ async def _chat_completions_streaming(payload: dict, request: Request) -> Stream
                                 return frame
 
                             if await request.is_disconnected():
+                                logger.info(
+                                    "chat_stream_disconnect idempotency=%s session=%s reason=client_http_disconnect",
+                                    idempotency_key[:16],
+                                    session_id_val[:16] if session_id_val else "pending",
+                                )
                                 try:
                                     await upstream.close()
                                 except Exception:
@@ -1142,6 +1151,21 @@ async def _chat_completions_streaming(payload: dict, request: Request) -> Stream
                 _turn_semaphore.release()
 
         except asyncio.CancelledError:
+            # The HTTP client disconnected (request.is_disconnected) or the
+            # portal relay aborted the upstream fetch.  Yield a generic
+            # unavailable error chunk + [DONE] (encode_error_chunk appends
+            # [DONE]) so the relay sees a well-formed SSE termination instead
+            # of a raw stream close — which would produce an HTTP 200
+            # "incomplete response" error on the browser side.
+            try:
+                yield encode_error_chunk(
+                    completion_id=completion_id,
+                    model=model,
+                    error_message=GENERIC_UNAVAILABLE_MESSAGE,
+                    session_id=None,
+                )
+            except Exception:
+                pass
             raise
         except TimeoutError:
             yield encode_error_chunk(
